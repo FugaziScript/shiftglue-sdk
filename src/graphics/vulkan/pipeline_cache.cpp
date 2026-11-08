@@ -741,10 +741,15 @@ void VulkanPipelineCache::InitializeShaderStorage(
            shader_storage_file_);
   }
 
+  const auto in_storage = [this](uint64_t hash) { return shaders_.find(hash) != shaders_.end(); };
+
   // The wrap seam fix's variants of the stored pipelines (gpu_wrap_seam_*), whichever way the
   // switch is set, so that turning it on compiles nothing in play. Derived, so not stored.
   std::vector<PipelineDescription> wrap_seam_descriptions;
   for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
+    if (!StoredPipelineShadersPresent(stored.description, in_storage)) {
+      continue;
+    }
     SpirvShaderTranslator::Modification vertex(stored.description.vertex_shader_modification);
     SpirvShaderTranslator::Modification pixel(stored.description.pixel_shader_modification);
     const WrapSeamBits bits =
@@ -776,8 +781,6 @@ void VulkanPipelineCache::InitializeShaderStorage(
       return;
     auto shader_it = shaders_.find(translation_needed.first);
     if (shader_it == shaders_.end()) {
-      if (initialization)
-        initialization->Fail("A stored pipeline has no matching shader.");
       continue;
     }
     auto* shader = shader_it->second;
@@ -810,8 +813,13 @@ void VulkanPipelineCache::InitializeShaderStorage(
   std::vector<PipelineDescription> pipeline_descriptions;
   pipeline_descriptions.reserve(pipeline_stored_descriptions.size() +
                                 wrap_seam_descriptions.size());
+  size_t without_shaders = 0;
   for (const PipelineStoredDescription& pipeline_stored_description :
        pipeline_stored_descriptions) {
+    if (!StoredPipelineShadersPresent(pipeline_stored_description.description, in_storage)) {
+      ++without_shaders;
+      continue;
+    }
     pipeline_descriptions.push_back(pipeline_stored_description.description);
   }
   pipeline_descriptions.insert(pipeline_descriptions.end(), wrap_seam_descriptions.begin(),
@@ -855,6 +863,10 @@ void VulkanPipelineCache::InitializeShaderStorage(
   for (const SpecializedStoredDescription& stored : specialized_stored_descriptions) {
     if (cancelled())
       return;
+    if (!StoredPipelineShadersPresent(stored.description, in_storage)) {
+      ++without_shaders;
+      continue;
+    }
     SpecializedKey key{stored.description, {}};
     std::memcpy(key.texture_signs.data(), stored.texture_signs, sizeof(stored.texture_signs));
     auto [entry, inserted] = specialized_pipelines_.try_emplace(key);
@@ -874,6 +886,11 @@ void VulkanPipelineCache::InitializeShaderStorage(
     creation_arguments.specialize_texture_signs = true;
     creation_arguments.texture_signs = key.texture_signs;
     pipeline_creations.push_back(creation_arguments);
+  }
+  if (without_shaders) {
+    REXGPU_INFO("VulkanPipelineCache: {} stored pipelines wait for shaders the game has not "
+                "made yet",
+                without_shaders);
   }
 
   if (cancelled() || (initialization && initialization->GetSnapshot().phase ==

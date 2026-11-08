@@ -10,11 +10,13 @@
 #include <condition_variable>
 #include <future>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 
 using namespace std::chrono_literals;
 using rex::graphics::RunStartupPipelineCompilation;
 using rex::graphics::ShaderStorageInitialization;
+using rex::graphics::StoredPipelineShadersPresent;
 
 TEST_CASE("Startup compiler completes all work with one or several workers", "[shader_startup]") {
   const size_t workers = GENERATE(1u, 4u);
@@ -123,4 +125,18 @@ TEST_CASE("Startup compiler accepts empty or already cancelled work", "[shader_s
       },
       [] {});
   REQUIRE(calls == 0);
+}
+
+TEST_CASE("Stored pipelines need their shaders in storage to start up", "[shader_startup]") {
+  struct Description {
+    uint64_t vertex_shader_hash;
+    uint64_t pixel_shader_hash;
+  };
+  const std::set<uint64_t> stored{0xA, 0xB};
+  const auto in_storage = [&](uint64_t hash) { return stored.count(hash) != 0; };
+  REQUIRE(StoredPipelineShadersPresent(Description{0xA, 0xB}, in_storage));
+  REQUIRE(StoredPipelineShadersPresent(Description{0xA, 0}, in_storage));
+  // The game makes some shaders only while it runs: their pipelines wait until then.
+  REQUIRE_FALSE(StoredPipelineShadersPresent(Description{0xC, 0xB}, in_storage));
+  REQUIRE_FALSE(StoredPipelineShadersPresent(Description{0xA, 0xC}, in_storage));
 }

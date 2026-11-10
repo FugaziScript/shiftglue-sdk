@@ -18,6 +18,8 @@
 
 #include <rex/ui/vulkan/upscaler.h>
 
+#include "ffx_runtime.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -65,6 +67,8 @@ struct FfxRuntime {
   PfnFfxDestroyContext destroy_context = nullptr;
   PfnFfxQuery query = nullptr;
   PfnFfxDispatch dispatch = nullptr;
+  // Optional: the upscalers do not configure, frame generation does.
+  PfnFfxConfigure configure = nullptr;
   std::string source;
   std::string error;
   bool loaded() const { return create_context && destroy_context && query && dispatch; }
@@ -95,6 +99,7 @@ const FfxRuntime& GetFfxRuntime() {
     runtime.destroy_context = &ffxDestroyContext;
     runtime.query = &ffxQuery;
     runtime.dispatch = &ffxDispatch;
+    runtime.configure = &ffxConfigure;
     runtime.source = "linked";
 #else
 #if REX_PLATFORM_WIN32
@@ -165,6 +170,7 @@ const FfxRuntime& GetFfxRuntime() {
           reinterpret_cast<PfnFfxDestroyContext>(symbol("ffxDestroyContext"));
       runtime.query = reinterpret_cast<PfnFfxQuery>(symbol("ffxQuery"));
       runtime.dispatch = reinterpret_cast<PfnFfxDispatch>(symbol("ffxDispatch"));
+      runtime.configure = reinterpret_cast<PfnFfxConfigure>(symbol("ffxConfigure"));
       if (runtime.loaded()) {
         runtime.source = path.string();
         runtime.error.clear();
@@ -603,6 +609,24 @@ class VulkanFfxUpscaler final : public VulkanUpscaler {
 };
 
 }  // namespace
+
+FfxApiEntryPoints GetFfxApiEntryPoints() {
+  const FfxRuntime& runtime = GetFfxRuntime();
+  FfxApiEntryPoints entry_points;
+  if (runtime.loaded()) {
+    entry_points.create_context = runtime.create_context;
+    entry_points.destroy_context = runtime.destroy_context;
+    entry_points.configure = runtime.configure;
+    entry_points.query = runtime.query;
+    entry_points.dispatch = runtime.dispatch;
+  }
+  return entry_points;
+}
+
+PFN_vkGetDeviceProcAddr GetFfxDeviceProcAddr(const VulkanDevice* device) {
+  GetFfxDeviceContext(device);
+  return GetDeviceProcAddrCompat;
+}
 #endif  // defined(REX_HAS_FFX_API) && REX_HAS_FFX_API
 
 std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(

@@ -78,6 +78,12 @@ REXCVAR_DEFINE_INT32(vulkan_log_pipeline_waits_ms, 0, "GPU/Vulkan",
                      "object slot variant, and whether the wait ran out); 0 turns it off")
     .range(0, 5000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(unprotected_page_check_interval, 1, "GPU/Vulkan",
+                     "Experimental: check preserved unprotected GPU pages every N draws. "
+                     "1 checks every draw; larger values reduce scan cost but may use stale "
+                     "vertex or texture data. Range-request checks remain enabled")
+    .range(1, INT32_MAX)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
@@ -6221,6 +6227,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   const bool program_timed = draw_cost_.enabled && draw_program_;
   const auto program_start =
       program_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+  // Texture request memos and vertex residency bits must observe CPU writes
+  // hidden by a larger host page before deciding that a binding is unchanged.
+  if (++unprotected_page_check_counter_ >=
+      uint32_t(REXCVAR_GET(unprotected_page_check_interval))) {
+    unprotected_page_check_counter_ = 0;
+    if (shared_memory_->CheckUnprotectedGpuPages()) {
+      InvalidateAllVertexBufferResidency();
+    }
+  }
   const bool issued =
       IssueDrawImpl(prim_type, index_count, index_buffer_info, major_mode_explicit);
   if (draw_cost_.enabled) {

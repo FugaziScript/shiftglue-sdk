@@ -1123,6 +1123,7 @@ class VulkanCommandProcessor : public CommandProcessor {
       texture_transient_descriptor_sets_free_;
 
   std::unique_ptr<VulkanSharedMemory> shared_memory_;
+  uint32_t unprotected_page_check_counter_ = 0;
 
   std::unique_ptr<VulkanPrimitiveProcessor> primitive_processor_;
 

@@ -8,6 +8,7 @@
 #include <rex/cvar.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/input_system.h>
+#include <rex/input/sdl/virtual_pad.h>
 
 // The X_STATUS_* / X_ERROR_* macros cast through these unqualified, so
 // FakeDriver cannot match the base class signatures without them.
@@ -51,10 +52,11 @@ class FakeDriver final : public InputDriver {
   X_STATUS Setup() override { return X_STATUS_SUCCESS; }
   bool is_keyboard_and_mouse() const override { return keyboard_; }
 
-  void Add(uint64_t id, bool synthetic = false) {
+  void Add(uint64_t id, bool synthetic = false, bool non_gamepad = false) {
     DeviceInfo info;
     info.id = static_cast<DeviceId>(id);
     info.synthetic = synthetic;
+    info.non_gamepad = non_gamepad;
     devices_.push_back(info);
     states_[static_cast<DeviceId>(id)] = {};
   }
@@ -293,6 +295,84 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+namespace {
+
+struct SlotSystem {
+  FakeDriver* driver = nullptr;
+  std::unique_ptr<InputSystem> system;
+
+  SlotSystem() {
+    auto owned = std::make_unique<FakeDriver>();
+    driver = owned.get();
+    system = std::make_unique<InputSystem>(nullptr);
+    system->AddDriver(std::move(owned));
+    system->SetDeviceAssignment(std::make_unique<SlotAssignment>());
+  }
+
+  // Which device feeds `user`, through the capabilities stamp; 0 = none.
+  uint8_t DeviceOf(uint32_t user) {
+    X_INPUT_CAPABILITIES caps = {};
+    if (system->GetCapabilities(user, 0, &caps) != X_ERROR_SUCCESS) {
+      return 0;
+    }
+    return caps.sub_type;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("A drum kit enumerated first leaves player 1 to the pad", "[input]") {
+  SlotSystem slots;
+  slots.driver->Add(1, false, true);
+  slots.driver->Add(2);
+  CHECK(slots.DeviceOf(0) == 2);
+  CHECK(slots.DeviceOf(1) == 1);
+}
+
+TEST_CASE("A pad connected after a drum kit takes player 1 from it", "[input]") {
+  SlotSystem slots;
+  slots.driver->Add(1, false, true);
+  CHECK(slots.DeviceOf(0) == 1);
+  slots.driver->Add(2);
+  CHECK(slots.DeviceOf(0) == 2);
+  CHECK(slots.DeviceOf(1) == 1);
+}
+
+TEST_CASE("Two pads keep players 1 and 2 with a drum kit connected", "[input]") {
+  SlotSystem slots;
+  slots.driver->Add(1);
+  slots.driver->Add(2, false, true);
+  CHECK(slots.DeviceOf(0) == 1);
+  CHECK(slots.DeviceOf(1) == 2);
+  slots.driver->Add(3);
+  CHECK(slots.DeviceOf(0) == 1);
+  CHECK(slots.DeviceOf(1) == 3);
+  CHECK(slots.DeviceOf(2) == 2);
+
+  // The second pad leaves and comes back as a new device: still player 2.
+  slots.driver->Remove(3);
+  slots.driver->Add(4);
+  CHECK(slots.DeviceOf(0) == 1);
+  CHECK(slots.DeviceOf(1) == 4);
+  CHECK(slots.DeviceOf(2) == 2);
+}
+
+TEST_CASE("A virtual pad leaves out the real pad it copies", "[input]") {
+  using rex::input::PadFamily;
+  using rex::input::sdl::HiddenBehindVirtualPad;
+  // DS4Windows without exclusive mode: the real DS4 or DualSense goes.
+  CHECK(HiddenBehindVirtualPad(PadFamily::kPlayStation, false, false, true));
+  CHECK(HiddenBehindVirtualPad(PadFamily::kNintendo, false, false, true));
+  // Its virtual DualShock 4 stays, and so do Xbox pads it does not copy.
+  CHECK_FALSE(HiddenBehindVirtualPad(PadFamily::kPlayStation, true, false, true));
+  CHECK_FALSE(HiddenBehindVirtualPad(PadFamily::kXbox, false, false, true));
+  CHECK_FALSE(HiddenBehindVirtualPad(PadFamily::kUnknown, false, false, true));
+  // Steam Input's virtual pad carries the real pad's family.
+  CHECK_FALSE(HiddenBehindVirtualPad(PadFamily::kPlayStation, false, true, true));
+  // No virtual pad: the real pad is used with its own features.
+  CHECK_FALSE(HiddenBehindVirtualPad(PadFamily::kPlayStation, false, false, false));
 }
 
 namespace {

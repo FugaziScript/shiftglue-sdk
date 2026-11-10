@@ -31,6 +31,7 @@
 #include <rex/input/sdl/hid_direct.h>
 #include <rex/input/sdl/joystick_mapping.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/sdl/virtual_pad.h>
 #include <rex/input/sdl/wheel.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
@@ -212,6 +213,19 @@ uint64_t SteadyNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
+}
+
+bool IsNonGamepad(SDL_JoystickType type) {
+  switch (type) {
+    case SDL_JOYSTICK_TYPE_DANCE_PAD:
+    case SDL_JOYSTICK_TYPE_GUITAR:
+    case SDL_JOYSTICK_TYPE_DRUM_KIT:
+    case SDL_JOYSTICK_TYPE_FLIGHT_STICK:
+    case SDL_JOYSTICK_TYPE_THROTTLE:
+      return true;
+    default:
+      return false;
+  }
 }
 
 PadFamily FamilyOf(SDL_GamepadType type) {
@@ -479,12 +493,23 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
     }
   }
 
+  constexpr uint64_t kVirtualCheckIntervalNs = 1'000'000'000;
+  if (std::any_of(controllers_.begin(), controllers_.end(),
+                  [](const ControllerState& c) { return c.hidden_by_virtual; }) &&
+      SteadyNs() - virtual_check_ns_ >= kVirtualCheckIntervalNs) {
+    UpdateVirtualPadHidingLocked();
+  }
+
   for (const auto& controller : controllers_) {
+    if (controller.hidden_by_virtual) {
+      continue;
+    }
     DeviceInfo info;
     info.id = controller.id;
     info.name = controller.name;
     info.guid = controller.guid;
     info.synthetic = false;
+    info.non_gamepad = controller.non_gamepad;
     info.family = controller.family;
     info.vendor_id = controller.vendor_id;
     info.product_id = controller.product_id;
@@ -869,6 +894,11 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   SDL_Joystick* joystick = SDL_GetGamepadJoystick(controller);
   state.instance_id = SDL_GetJoystickID(joystick);
   state.wheel_type = SDL_GetJoystickType(joystick) == SDL_JOYSTICK_TYPE_WHEEL;
+  state.non_gamepad = IsNonGamepad(SDL_GetJoystickType(joystick));
+  if (state.non_gamepad) {
+    REXLOG_INFO("SDL OnControllerDeviceAdded: not a gamepad, it takes a player only after every "
+                "gamepad.");
+  }
   char guid_text[33] = {};
   SDL_GUIDToString(SDL_GetJoystickGUID(joystick), guid_text, static_cast<int>(sizeof(guid_text)));
   state.guid = guid_text;
@@ -900,14 +930,17 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
     state.hid_path = path;
   }
   state.bluetooth = connection == SDL_JOYSTICK_CONNECTION_WIRELESS;
+#if defined(_WIN32)
+  state.virtual_pad = IsVirtualPadPath(state.hid_path);
+#endif
   REXLOG_INFO(
       "SDL pad: \"{}\" family {} vendor 0x{:04X} product 0x{:04X} {} steam_virtual {} "
-      "adaptive_triggers {} lightbar {} motion {}",
+      "vigem_virtual {} adaptive_triggers {} lightbar {} motion {}",
       pad_name ? pad_name : "", FamilyName(state.family), state.vendor_id, state.product_id,
       connection == SDL_JOYSTICK_CONNECTION_WIRELESS ? "wireless"
       : connection == SDL_JOYSTICK_CONNECTION_WIRED  ? "wired"
                                                      : "unknown-link",
-      state.steam_virtual, state.dualsense, state.lightbar, state.motion);
+      state.steam_virtual, state.virtual_pad, state.dualsense, state.lightbar, state.motion);
   if (state.steam_virtual) {
     REXLOG_INFO(
         "SDL pad: Steam Input stands between the game and this pad; turn Steam Input off for "
@@ -915,6 +948,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
   }
   UpdateXCapabilities(state);
   controllers_.push_back(state);
+  UpdateVirtualPadHidingLocked();
 
   const int ordinal = static_cast<int>(controllers_.size()) - 1;
   SDL_SetGamepadPlayerIndex(controller, ordinal);
@@ -936,6 +970,7 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
   }
   SDL_CloseGamepad(controllers_.at(*idx).sdl);
   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
+  UpdateVirtualPadHidingLocked();
 
   // LEDs only. Guest user assignment does not shift, because InputSystem holds
   // each device's ordinal.
@@ -943,6 +978,30 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
     SDL_SetGamepadPlayerIndex(controllers_[i].sdl, static_cast<int>(i));
   }
   REXLOG_INFO("SDL OnControllerDeviceRemoved: {} device(s) remain.", controllers_.size());
+}
+
+void SDLInputDriver::UpdateVirtualPadHidingLocked() {
+#if defined(_WIN32)
+  virtual_check_ns_ = SteadyNs();
+  const bool virtual_present = VirtualPadPresent();
+  for (auto& controller : controllers_) {
+    const bool hidden = HiddenBehindVirtualPad(controller.family, controller.virtual_pad,
+                                               controller.steam_virtual, virtual_present);
+    if (hidden == controller.hidden_by_virtual) {
+      continue;
+    }
+    controller.hidden_by_virtual = hidden;
+    if (hidden) {
+      REXLOG_INFO(
+          "SDL pad: \"{}\" is left out: DS4Windows or another ViGEm tool shows it to the game as "
+          "a virtual pad, which is used instead. Close that tool for this pad's own triggers, "
+          "lightbar and motion.",
+          controller.name);
+    } else {
+      REXLOG_INFO("SDL pad: \"{}\" is used again: its virtual pad is gone.", controller.name);
+    }
+  }
+#endif
 }
 
 void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) {

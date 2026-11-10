@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -135,49 +136,60 @@ void InputSystem::RefreshDevices() {
   }
 
   // Carry forward ordinals already handed out, so a device keeps its guest user
-  // when another pad is unplugged.
+  // when another pad is unplugged. Non-gamepads are ranked again on every
+  // refresh, behind every gamepad, so a pad that connects after a drum kit
+  // still takes player one from it.
   bool changed = seen.size() != devices_.size();
   std::vector<bool> fresh(seen.size(), false);
+  std::vector<std::optional<uint32_t>> previous(seen.size());
   for (size_t i = 0; i < seen.size(); i++) {
     auto existing = std::find_if(devices_.begin(), devices_.end(),
                                  [&](const DeviceInfo& d) { return d.id == seen[i].id; });
-    if (existing != devices_.end()) {
+    if (existing == devices_.end()) {
+      fresh[i] = true;
+      changed = true;
+    } else if (seen[i].non_gamepad) {
+      previous[i] = existing->ordinal;
+      fresh[i] = true;
+    } else {
       seen[i].ordinal = existing->ordinal;
-      continue;
     }
-    fresh[i] = true;
-    changed = true;
   }
 
   // Runs after the carry-forward pass so a new device cannot take an ordinal a
   // live one is still holding. Lowest free rather than a growing counter,
   // because a reconnected pad arrives as a new device and would otherwise walk
   // off the end of the guest users.
-  for (size_t i = 0; i < seen.size(); i++) {
-    if (!fresh[i]) {
-      continue;
-    }
-    // Only physical devices consume an ordinal, so the first pad to connect is
-    // guest user 0 however many synthetic devices enumerated ahead of it.
-    if (seen[i].synthetic) {
-      seen[i].ordinal = kSyntheticOrdinal;
-      fresh[i] = false;
-      continue;
-    }
-    auto taken = [&](uint32_t candidate) {
-      for (size_t j = 0; j < seen.size(); j++) {
-        if (!fresh[j] && !seen[j].synthetic && seen[j].ordinal == candidate) {
-          return true;
-        }
+  auto taken = [&](uint32_t candidate) {
+    for (size_t j = 0; j < seen.size(); j++) {
+      if (!fresh[j] && !seen[j].synthetic && seen[j].ordinal == candidate) {
+        return true;
       }
-      return false;
-    };
-    uint32_t ordinal = 0;
-    while (taken(ordinal)) {
-      ordinal++;
     }
-    seen[i].ordinal = ordinal;
-    fresh[i] = false;
+    return false;
+  };
+  for (const bool non_gamepads : {false, true}) {
+    for (size_t i = 0; i < seen.size(); i++) {
+      if (!fresh[i] || seen[i].non_gamepad != non_gamepads) {
+        continue;
+      }
+      // Only physical devices consume an ordinal, so the first pad to connect
+      // is guest user 0 however many synthetic devices enumerated ahead of it.
+      if (seen[i].synthetic) {
+        seen[i].ordinal = kSyntheticOrdinal;
+        fresh[i] = false;
+        continue;
+      }
+      uint32_t ordinal = 0;
+      while (taken(ordinal)) {
+        ordinal++;
+      }
+      seen[i].ordinal = ordinal;
+      fresh[i] = false;
+      if (previous[i] && *previous[i] != ordinal) {
+        changed = true;
+      }
+    }
   }
 
   for (const auto& old : devices_) {

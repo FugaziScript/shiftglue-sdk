@@ -84,6 +84,12 @@ REXCVAR_DEFINE_INT32(unprotected_page_check_interval, 1, "GPU/Vulkan",
                      "vertex or texture data. Range-request checks remain enabled")
     .range(1, INT32_MAX)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DECLARE(bool, present_hdr_native);
+REXCVAR_DECLARE(double, present_hdr_native_knee);
+REXCVAR_DECLARE(double, present_hdr_paper_white_nits);
+REXCVAR_DECLARE(double, present_hdr_peak_nits);
+REXCVAR_DECLARE(double, present_hdr_gamma);
+
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
 REXCVAR_DECLARE(bool, gpu_async_fence_probe);
@@ -4301,6 +4307,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
   VkImageView camera_depth_view = VK_NULL_HANDLE;
   VkImage native_hud_image = VK_NULL_HANDLE;
   uint32_t native_hud_width = 0, native_hud_height = 0;
+  VkImage hdr_gain_image = VK_NULL_HANDLE;
+  uint32_t hdr_gain_width = 0, hdr_gain_height = 0;
   Fh1NativeExecutor::Camera camera = {};
   const bool scene_fxaa =
       swap_post_effect != SwapPostEffect::kNone && REXCVAR_GET(swap_post_effect_scene_only);
@@ -4314,6 +4322,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
         fh1_native_executor_->TakeHudSnapshot(guest_output_width, guest_output_height);
     native_hud_image =
         fh1_native_executor_->TakeHudLayer(native_hud_width, native_hud_height);
+    hdr_gain_image = fh1_native_executor_->TakeHdrGain(hdr_gain_width, hdr_gain_height);
     fh1_native_executor_->SetCameraTrackingEnabled(camera_wanted);
     // UP-1.7: once the object slot image is the guest output's size (made
     // between frames, IssueSwap) and initialised by a camera pass.
@@ -4348,7 +4357,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
        frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
        camera, plain_ground_motion, native_hud_image, native_hud_width,
-       native_hud_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+       native_hud_height, hdr_gain_image, hdr_gain_width,
+       hdr_gain_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
         // In case the swap command is the only one in the frame.
         if (!BeginSubmission(true)) {
           return false;
@@ -4938,6 +4948,33 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                    ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
             vulkan_context.SetNativeHudWritten();
+          }
+
+          // present_hdr_native: the frame's HDR gain map (fh1_hdr_gain.cpp).
+          if (hdr_gain_image != VK_NULL_HANDLE &&
+              vulkan_context.EnsureHdrGainImage(hdr_gain_width, hdr_gain_height)) {
+            const VkImage hdr_gain_destination = vulkan_context.hdr_gain_image();
+            PushImageMemoryBarrier(hdr_gain_destination, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            SubmitBarriers(true);
+            VkImageCopy hdr_gain_region = {};
+            hdr_gain_region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            hdr_gain_region.dstSubresource = hdr_gain_region.srcSubresource;
+            hdr_gain_region.extent = {hdr_gain_width, hdr_gain_height, 1};
+            deferred_command_buffer_.CmdVkCopyImage(
+                hdr_gain_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hdr_gain_destination,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, hdr_gain_region);
+            PushImageMemoryBarrier(hdr_gain_destination, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_ACCESS_TRANSFER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            vulkan_context.SetHdrGainWritten();
           }
 
           // UP-1.3 and UP-1.4: the depth and camera motion beside it.
@@ -7083,6 +7120,26 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
   texture_cache_->set_skip_unchanged_requests(unchanged_inputs, unchanged_verify);
   const uint64_t texture_hits_before = texture_cache_->unchanged_request_hits();
   texture_cache_->RequestTextures(used_texture_mask);
+  // present_hdr_native: FM4's tonemap draw's scene, bloom and average luminance, as its
+  // descriptors take them; the bindings do not last until after the draw.
+  constexpr uint64_t kFm4TonemapPixelShaderHash = 0xE97AA211B556A9B3ull;
+  VkImageView hdr_gain_views[3] = {};
+  if (pixel_shader && pixel_shader->ucode_data_hash() == kFm4TonemapPixelShaderHash) {
+    const auto bound_view = [this](const VulkanShader* shader, uint32_t fetch) {
+      for (const VulkanShader::TextureBinding& binding :
+           shader->GetTextureBindingsAfterTranslation()) {
+        // A fetch may be bound both signed and unsigned; FM4's luminance is bound signed.
+        if (binding.fetch_constant != fetch) continue;
+        const VkImageView view = texture_cache_->GetActiveBindingOrNullImageView(
+            fetch, binding.dimension, bool(binding.is_signed));
+        if (view != VK_NULL_HANDLE) return view;
+      }
+      return VkImageView(VK_NULL_HANDLE);
+    };
+    hdr_gain_views[0] = bound_view(pixel_shader, 0);
+    hdr_gain_views[1] = bound_view(pixel_shader, 2);
+    hdr_gain_views[2] = bound_view(vertex_shader, 17);
+  }
   if (fh1_native_executor_ && fh1_native_executor_->inspection_active())
     fh1_native_executor_->InspectTextures(used_texture_mask);
   texture_inputs_generation_ += texture_cache_->unchanged_request_hits() == texture_hits_before;
@@ -7791,6 +7848,96 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     fh1_native_executor_->VisEnd(vis_query);
     fh1_native_executor_->EndLabelGpuTiming(draw_gpu_timing);
     fh1_native_executor_->NativeDrawIssued(fh1_draw);
+    // present_hdr_native: FM4's tonemap draw (fsr4-patch/hdr/POST_CHAIN.md) gives its inputs
+    // to the HDR gain map.
+    constexpr uint64_t kFm4TonemapPixelShader = 0xE97AA211B556A9B3ull;
+    if (pixel_shader && pixel_shader->ucode_data_hash() == kFm4TonemapPixelShader &&
+        REXCVAR_GET(present_hdr_native) && ui::vulkan::GetHdrOutputState().active &&
+        program_probe == 0) {
+      Fh1NativeExecutor::HdrGainInputs gain;
+      gain.scene = hdr_gain_views[0];
+      gain.bloom = hdr_gain_views[1];
+      gain.luminance = hdr_gain_views[2];
+      auto& constants = gain.constants;
+      const auto vertex_constant = [&regs](uint32_t index, float (&out)[4]) {
+        std::memcpy(out, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * index],
+                    sizeof(out));
+      };
+      vertex_constant(2, constants.keys);
+      vertex_constant(3, constants.key_exposures);
+      vertex_constant(4, constants.wabc);
+      vertex_constant(5, constants.def_offset);
+      constants.scene_scale = std::exp2(float(regs.GetTextureFetch(0).exp_adjust));
+      constants.bloom_scale = std::exp2(float(regs.GetTextureFetch(2).exp_adjust));
+      constants.gamma = float(REXCVAR_GET(present_hdr_gamma));
+      if (constants.gamma <= 0.0f) constants.gamma = 2.2f;
+      constants.peak = float(std::max(
+          REXCVAR_GET(present_hdr_peak_nits) / REXCVAR_GET(present_hdr_paper_white_nits), 1.0));
+      const auto scissor = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      constants.size[0] = scissor.br_x * texture_cache_->draw_resolution_scale_x();
+      constants.size[1] = scissor.br_y * texture_cache_->draw_resolution_scale_y();
+      // Where each output pixel samples the scene and the bloom, as the tonemap draw does: its
+      // rectangle's vertices (position xy, texcoord uv; vf0, 16 bytes each) through the
+      // viewport give the screen, and its vertex shader samples at 1 - uv, the bloom further
+      // at that * c1.x + c1.yz. FM4 draws its scene turned, so this turns it back.
+      bool mapped = false;
+      const xenos::xe_gpu_vertex_fetch_t vertex_fetch =
+          regs.GetVertexFetch(vertex_shader->vertex_bindings().empty()
+                                  ? 0
+                                  : vertex_shader->vertex_bindings()[0].fetch_constant);
+      const auto* vertices =
+          vertex_fetch.type == xenos::FetchConstantType::kVertex && vertex_fetch.size >= 12
+              ? memory_->TranslatePhysical<const uint32_t*>(vertex_fetch.address << 2)
+              : nullptr;
+      if (vertices && scissor.br_x && scissor.br_y) {
+        const auto word = [&](uint32_t i) {
+          return std::bit_cast<float>(rex::byte_swap(vertices[i]));
+        };
+        const float x_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+        const float x_offset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+        const float y_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+        const float y_offset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+        const float c0x = std::bit_cast<float>(regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+        float screen[3][2], sample[3][2];
+        for (uint32_t v = 0; v < 3; ++v) {
+          screen[v][0] = (word(v * 4) * c0x * x_scale + x_offset) / float(scissor.br_x);
+          screen[v][1] = (word(v * 4 + 1) * y_scale + y_offset) / float(scissor.br_y);
+          sample[v][0] = 1.0f - word(v * 4 + 2);
+          sample[v][1] = 1.0f - word(v * 4 + 3);
+        }
+        mapped = true;
+        for (uint32_t axis = 0; axis < 2 && mapped; ++axis) {
+          uint32_t other = 1;
+          while (other < 3 && std::abs(screen[other][axis] - screen[0][axis]) < 1.0e-3f) ++other;
+          if (other == 3) {
+            mapped = false;
+            break;
+          }
+          const float scale =
+              (sample[other][axis] - sample[0][axis]) / (screen[other][axis] - screen[0][axis]);
+          constants.scene_map[axis] = scale;
+          constants.scene_map[2 + axis] = sample[0][axis] - scale * screen[0][axis];
+        }
+        mapped = mapped && std::isfinite(constants.scene_map[0]) &&
+                 std::isfinite(constants.scene_map[1]) &&
+                 std::isfinite(constants.scene_map[2]) && std::isfinite(constants.scene_map[3]);
+      }
+      if (!mapped) {
+        // Turned, as FM4 draws its races.
+        constants.scene_map[0] = -1.0f;
+        constants.scene_map[1] = -1.0f;
+        constants.scene_map[2] = 1.0f;
+        constants.scene_map[3] = 1.0f;
+      }
+      float c1[4];
+      vertex_constant(1, c1);
+      constants.bloom_map[0] = constants.scene_map[0] * c1[0];
+      constants.bloom_map[1] = constants.scene_map[1] * c1[0];
+      constants.bloom_map[2] = constants.scene_map[2] * c1[0] + c1[1];
+      constants.bloom_map[3] = constants.scene_map[3] * c1[0] + c1[2];
+      constants.knee = float(REXCVAR_GET(present_hdr_native_knee));
+      fh1_native_executor_->CaptureHdrGain(gain);
+    }
     // fh1_native_hud: the HUD draw again, at the presentation's resolution.
     if ((fh1_native_executor_->IsHudDraw() || fh1_native_executor_->IsHudDepthDraw()) &&
         fh1_native_executor_->HudLayerEnabled() &&

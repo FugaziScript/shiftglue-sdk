@@ -611,6 +611,17 @@ void Fh1NativeExecutor::Shutdown() {
   for (auto& [packed, surface] : surfaces_) DestroySurface(surface);
   surfaces_.clear();
   DestroyHudSnapshot();
+  DestroyHdrGainImage();
+  if (hdr_gain_pipeline_) dfn.vkDestroyPipeline(device, hdr_gain_pipeline_, nullptr);
+  if (hdr_gain_pipeline_layout_) {
+    dfn.vkDestroyPipelineLayout(device, hdr_gain_pipeline_layout_, nullptr);
+  }
+  if (hdr_gain_set_layout_) {
+    dfn.vkDestroyDescriptorSetLayout(device, hdr_gain_set_layout_, nullptr);
+  }
+  hdr_gain_pipeline_ = VK_NULL_HANDLE;
+  hdr_gain_pipeline_layout_ = VK_NULL_HANDLE;
+  hdr_gain_set_layout_ = VK_NULL_HANDLE;
   DestroyCamera();
   for (auto& [key, pipeline] : transfer_pipelines_) dfn.vkDestroyPipeline(device, pipeline, nullptr);
   transfer_pipelines_.clear();
@@ -3504,6 +3515,8 @@ void Fh1NativeExecutor::OnSwap(uint64_t frame) {
   BeginInspection();
   hud_snapshot_ready_ = hud_snapshot_taken_;
   hud_snapshot_taken_ = false;
+  hdr_gain_ready_ = hdr_gain_taken_;
+  hdr_gain_taken_ = false;
   hud_scene_base_ = UINT32_MAX;
   hud_layer_ready_ = hud_layer_cleared_ && hud_layer_complete_;
   hud_layer_cleared_ = false;

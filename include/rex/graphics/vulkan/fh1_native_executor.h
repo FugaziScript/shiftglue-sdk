@@ -174,6 +174,37 @@ class Fh1NativeExecutor {
   // shaders, if it covers width x height; null otherwise.
   VkImageView TakeHudSnapshot(uint32_t width, uint32_t height);
 
+  // present_hdr_native (fh1_hdr_gain.cpp): at FM4's tonemap draw, how much brighter than
+  // the game's SDR picture each pixel is on an HDR display, from the tonemap's own inputs.
+  struct HdrGainConstants {
+    // The tonemap vertex shader's c2-c5 (fsr4-patch/hdr/POST_CHAIN.md).
+    float keys[4];
+    float key_exposures[4];
+    float wabc[4];
+    float def_offset[4];
+    // Output UV to the scene's and the bloom's: scale xy, offset zw.
+    float scene_map[4];
+    float bloom_map[4];
+    float scene_scale;
+    float bloom_scale;
+    float gamma;
+    float peak;
+    uint32_t size[2];
+    float knee;
+    float padding;
+  };
+  static_assert(sizeof(HdrGainConstants) <= 128, "push constants");
+  struct HdrGainInputs {
+    VkImageView scene = VK_NULL_HANDLE;
+    VkImageView bloom = VK_NULL_HANDLE;
+    VkImageView luminance = VK_NULL_HANDLE;
+    HdrGainConstants constants = {};
+  };
+  void CaptureHdrGain(const HdrGainInputs& inputs);
+  // After OnSwap: the swapped frame's gain map (R16_SFLOAT) in TRANSFER_SRC_OPTIMAL once the
+  // caller submits the barriers, or VK_NULL_HANDLE when the frame had no tonemap draw.
+  VkImage TakeHdrGain(uint32_t& width_out, uint32_t& height_out);
+
   // UP-1.3: the camera and depth a temporal upscaler needs (fh1_camera.cpp).
   // While enabled, every scene draw's world-view-projection (vertex float
   // constants c128-c131, one row each) is noted, and the scene depth is
@@ -735,6 +766,15 @@ class Fh1NativeExecutor {
   uint32_t camera_depth_rows_ready_ = 0;
   // The rows the bands need; the copy is resized to it between frames.
   uint32_t camera_depth_wanted_height_ = 0;
+  bool EnsureHdrGainPipeline();
+  void DestroyHdrGainImage();
+  Surface hdr_gain_;
+  bool hdr_gain_taken_ = false;
+  bool hdr_gain_ready_ = false;
+  bool hdr_gain_failed_ = false;
+  VkDescriptorSetLayout hdr_gain_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout hdr_gain_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline hdr_gain_pipeline_ = VK_NULL_HANDLE;
   bool camera_depth_failed_ = false;
   VkDescriptorSetLayout camera_depth_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout camera_depth_pipeline_layout_ = VK_NULL_HANDLE;

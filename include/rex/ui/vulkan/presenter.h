@@ -151,6 +151,16 @@ class VulkanPresenter final : public Presenter {
       native_hud_written_out_ = native_hud_written_out;
     }
 
+    // present_hdr_native: how much brighter than the guest output each pixel is on an HDR
+    // display (VK_FORMAT_R16_SFLOAT, the guest output's own size); released to
+    // kGuestOutputInternal* like the guest output. Painting takes it after SetHdrGainWritten.
+    bool EnsureHdrGainImage(uint32_t width, uint32_t height);
+    VkImage hdr_gain_image() const;
+    void SetHdrGainWritten();
+    void set_hdr_gain_written_out(bool* hdr_gain_written_out) {
+      hdr_gain_written_out_ = hdr_gain_written_out;
+    }
+
     // UP-1.3 and UP-1.4, when WantsGuestOutputCamera: the scene depth (guest
     // z in [0, 1], kGuestOutputDepthFormat), the motion of each pixel to its
     // place in the previous frame (in UV units, kGuestOutputMotionFormat) and
@@ -175,6 +185,7 @@ class VulkanPresenter final : public Presenter {
     GuestOutputImage* guest_output_image_;
     bool* hudless_written_out_;
     bool* native_hud_written_out_ = nullptr;
+    bool* hdr_gain_written_out_ = nullptr;
     UpscalerCamera* camera_out_;
     bool* camera_written_out_;
   };
@@ -272,6 +283,10 @@ class VulkanPresenter final : public Presenter {
     bool EnsureNativeHud(uint32_t width, uint32_t height);
     VkImage native_hud_image() const { return native_hud_image_; }
     VkImageView native_hud_view() const { return native_hud_view_; }
+    // The HDR gain map (VulkanGuestOutputRefreshContext::EnsureHdrGainImage).
+    bool EnsureHdrGain(uint32_t width, uint32_t height);
+    VkImage hdr_gain_image() const { return hdr_gain_image_; }
+    VkImageView hdr_gain_view() const { return hdr_gain_view_; }
     // The camera images (VulkanGuestOutputRefreshContext::EnsureCameraImages).
     bool EnsureCamera();
     VkImage depth_image() const { return depth_image_; }
@@ -313,6 +328,10 @@ class VulkanPresenter final : public Presenter {
     VkDeviceMemory native_hud_memory_ = VK_NULL_HANDLE;
     VkImageView native_hud_view_ = VK_NULL_HANDLE;
     VkExtent2D native_hud_extent_ = {};
+    VkImage hdr_gain_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory hdr_gain_memory_ = VK_NULL_HANDLE;
+    VkImageView hdr_gain_view_ = VK_NULL_HANDLE;
+    VkExtent2D hdr_gain_extent_ = {};
     VkImage depth_image_ = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory_ = VK_NULL_HANDLE;
     VkImageView depth_view_ = VK_NULL_HANDLE;
@@ -335,6 +354,7 @@ class VulkanPresenter final : public Presenter {
     // images with this camera.
     bool hudless_valid = false;
     bool native_hud_valid = false;
+    bool hdr_gain_valid = false;
     bool camera_valid = false;
     UpscalerCamera camera;
     uint64_t last_refresher_submission = 0;
@@ -823,6 +843,11 @@ class VulkanPresenter final : public Presenter {
   VkPipeline upscale_debug_view_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool upscale_hud_composite_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, PaintContext::kSubmissionCount> upscale_hud_composite_sets_ = {};
+  // present_hdr_native: the HDR pass's set 1, the painted guest output's HDR gain map, one
+  // per paint submission (EnsureHdrGainSets).
+  bool EnsureHdrGainSets();
+  VkDescriptorPool hdr_gain_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, PaintContext::kSubmissionCount> hdr_gain_sets_ = {};
   VkQueryPool temporal_upscale_query_pool_ = VK_NULL_HANDLE;
   std::array<uint64_t, 8> temporal_upscale_query_submissions_ = {};
   double temporal_upscale_gpu_ns_ = 0.0;

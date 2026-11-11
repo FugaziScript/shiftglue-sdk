@@ -96,6 +96,14 @@ bool VulkanPresenter::ConnectDxgiSwapchain(Surface& surface, uint32_t width, uin
       (REXCVAR_GET(present_hdr) || present_mode_changed || frame_generation)) {
     paint_context_.DestroySwapchainAndVulkanSurface();
   }
+  // Once HDR presented through the Vulkan swapchain, a DXGI swapchain on the same window
+  // stalled for seconds and then failed to resize its buffers (E_OUTOFMEMORY) when HDR was
+  // turned off: the Vulkan swapchain stays for the rest of the session.
+  if (REXCVAR_GET(present_hdr) && win32_surface && !paint_context_.dxgi_swapchain_failed) {
+    REXLOG_INFO("VulkanPresenter: HDR presents through the Vulkan swapchain, which stays for "
+                "the rest of the session");
+    paint_context_.dxgi_swapchain_failed = true;
+  }
   if (!REXCVAR_GET(vulkan_present_via_dxgi) || REXCVAR_GET(present_hdr) ||
       paint_context_.dxgi_swapchain_failed || !win32_surface || frame_generation) {
     return false;

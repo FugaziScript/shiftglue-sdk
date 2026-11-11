@@ -15,6 +15,9 @@ layout(push_constant) uniform UpscaleHudLayerConstants {
   // The share of the source images the upscaler read (its input size over
   // the image size).
   vec2 source_uv_scale;
+  // fh1_native_hud: binding 1 is the HUD drawn at the presentation's
+  // resolution (premultiplied), which becomes the layer.
+  uint native_hud;
 } constants;
 layout(set = 0, binding = 0) uniform sampler2D frame;
 layout(set = 0, binding = 1) uniform sampler2D hudless;
@@ -22,6 +25,12 @@ layout(set = 0, binding = 2, rgba8) uniform writeonly image2D hud_layer;
 void main() {
   uvec2 pixel = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(pixel, constants.output_size))) {
+    return;
+  }
+  if (constants.native_hud != 0u) {
+    vec4 native_hud = textureLod(hudless, (vec2(pixel) + 0.5) * constants.output_size_inv, 0.0);
+    vec3 straight = native_hud.a > 0.0 ? min(native_hud.rgb / native_hud.a, vec3(1.0)) : vec3(0.0);
+    imageStore(hud_layer, ivec2(pixel), vec4(straight, native_hud.a));
     return;
   }
   vec2 uv = (vec2(pixel) + 0.5) * constants.output_size_inv * constants.source_uv_scale;

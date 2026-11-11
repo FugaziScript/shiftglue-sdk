@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <ctime>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -23,9 +25,22 @@ REXCVAR_DEFINE_STRING(fh1_frame_dump_path, "", "GPU",
                       "File the recorded FH1 frame dump is written to")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DECLARE(std::string, log_file);
+
 namespace rex::graphics {
 
 namespace {
+
+// A frame dump requested while the game runs: an empty file named dump_frame in the log
+// folder (log_file's, else logs beside the working directory) records the next complete
+// frame; without fh1_frame_dump_path it goes to frame-dumps in that folder.
+std::filesystem::path DumpTriggerFolder() {
+  const std::string& log_file = REXCVAR_GET(log_file);
+  if (!log_file.empty()) return std::filesystem::path(log_file).parent_path();
+  return std::filesystem::current_path() / "logs";
+}
+
+std::filesystem::path triggered_path;
 
 using namespace xenos;
 
@@ -77,12 +92,41 @@ Fh1FrameDump::~Fh1FrameDump() {
 
 uint64_t Fh1FrameDump::RequestedFrame() {
   const int32_t requested = REXCVAR_GET(fh1_frame_dump_frame);
-  if (!requested) return 0;
+  if (!requested) {
+    // The trigger file, looked for about twice a second.
+    static uint32_t polls = 0;
+    if (++polls % 60) return 0;
+    std::error_code error;
+    const std::filesystem::path folder = DumpTriggerFolder();
+    const std::filesystem::path trigger = folder / "dump_frame";
+    if (!std::filesystem::exists(trigger, error)) return 0;
+    std::filesystem::remove(trigger, error);
+    if (REXCVAR_GET(fh1_frame_dump_path).empty()) {
+      const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      std::tm local = {};
+#if defined(_WIN32)
+      localtime_s(&local, &now);
+#else
+      localtime_r(&now, &local);
+#endif
+      char name[64];
+      std::strftime(name, sizeof(name), "frame-%Y%m%d-%H%M%S.fh1dump", &local);
+      triggered_path = folder / "frame-dumps" / name;
+    }
+    REXGPU_INFO("FH1 frame dump: dump_frame found in {}, recording the next frame",
+                rex::path_to_utf8(folder));
+    return std::numeric_limits<uint64_t>::max();
+  }
   REXCVAR_SET(fh1_frame_dump_frame, 0);
   return requested < 0 ? std::numeric_limits<uint64_t>::max() : uint64_t(requested);
 }
 
 std::filesystem::path Fh1FrameDump::RequestedPath() {
+  if (!triggered_path.empty()) {
+    std::filesystem::path path = std::move(triggered_path);
+    triggered_path.clear();
+    return path;
+  }
   return std::filesystem::path(REXCVAR_GET(fh1_frame_dump_path));
 }
 

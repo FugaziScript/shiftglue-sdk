@@ -3576,7 +3576,7 @@ bool VulkanCommandProcessor::EnsureSwapHudMask() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(uint32_t) * 2};
+                                             sizeof(uint32_t) * 3};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -4792,7 +4792,8 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             deferred_command_buffer_.CmdVkBindDescriptorSets(
                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
                 &hud_mask_set, 0, nullptr);
-            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
+            // The mask marks the HUD here (no_hud is 0).
+            const uint32_t hud_mask_size[3] = {guest_output_width, guest_output_height, 0};
             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hud_mask_size), hud_mask_size);
@@ -4807,6 +4808,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           // then the HUD's coverage into its alpha. Not where a frame has no
           // snapshot (menus), whose guest output is all HUD.
           bool hudless_written = false;
+          bool native_hud_destination_ready = false;
           VkPipeline hudless_gamma_pipeline = use_pwl_gamma_ramp
                                                   ? swap_apply_gamma_compute_pwl_pipeline_
                                                   : swap_apply_gamma_compute_256_entry_table_pipeline_;
@@ -4884,7 +4886,13 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
             deferred_command_buffer_.CmdVkBindDescriptorSets(
                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
                 &hudless_mask_set, 0, nullptr);
-            const uint32_t hudless_mask_size[2] = {guest_output_width, guest_output_height};
+            // fh1_native_hud: the HUD comes in its own image (below), so the
+            // HUD-less image's alpha is left to the mirror glass.
+            native_hud_destination_ready =
+                native_hud_image != VK_NULL_HANDLE &&
+                vulkan_context.EnsureNativeHudImage(native_hud_width, native_hud_height);
+            const uint32_t hudless_mask_size[3] = {guest_output_width, guest_output_height,
+                                                   uint32_t(native_hud_destination_ready)};
             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                                         sizeof(hudless_mask_size),
@@ -4907,8 +4915,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
 
           // fh1_native_hud: the HUD drawn at the presentation's resolution,
           // beside the HUD-less image it goes with.
-          if (hudless_written && native_hud_image != VK_NULL_HANDLE &&
-              vulkan_context.EnsureNativeHudImage(native_hud_width, native_hud_height)) {
+          if (hudless_written && native_hud_destination_ready) {
             const VkImage native_hud_destination = vulkan_context.native_hud_image();
             PushImageMemoryBarrier(native_hud_destination, guest_output_subresource_range,
                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,

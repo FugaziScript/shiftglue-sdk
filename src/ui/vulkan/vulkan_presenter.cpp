@@ -473,8 +473,10 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
   upscale_hud_composite_failed_ = true;
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  for (uint32_t i = 0; i < 3; ++i) {
+  // 0: the guest output, 1: its HUD-less image, 2: the image written, 3: the
+  // native HUD (the HUD-less image again where a frame has none).
+  VkDescriptorSetLayoutBinding bindings[4] = {};
+  for (uint32_t i = 0; i < 4; ++i) {
     bindings[i].binding = i;
     bindings[i].descriptorType =
         i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -483,7 +485,7 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
   }
   VkDescriptorSetLayoutCreateInfo set_layout_info = {};
   set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_layout_info.bindingCount = 3;
+  set_layout_info.bindingCount = 4;
   set_layout_info.pBindings = bindings;
   if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
                                       &upscale_hud_composite_set_layout_) != VK_SUCCESS) {
@@ -506,7 +508,7 @@ bool VulkanPresenter::EnsureUpscaleHudComposite() {
   }
   const uint32_t set_count = uint32_t(upscale_hud_composite_sets_.size());
   VkDescriptorPoolSize pool_sizes[2] = {
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * set_count},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * set_count},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, set_count},
   };
   VkDescriptorPoolCreateInfo pool_info = {};
@@ -862,15 +864,16 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
       upscale_hud_composite_sets_[submission_index % upscale_hud_composite_sets_.size()];
   const VkSampler linear_sampler =
       ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
-  VkDescriptorImageInfo images[3] = {
+  VkDescriptorImageInfo images[4] = {
       {linear_sampler, source.view(), kGuestOutputInternalLayout},
-      {linear_sampler, native_hud ? source.native_hud_view() : source.hudless_view(),
-       kGuestOutputInternalLayout},
+      {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
       {VK_NULL_HANDLE, paint_context_.frame_generation_hud_views[hud_index],
        VK_IMAGE_LAYOUT_GENERAL},
+      {linear_sampler, native_hud ? source.native_hud_view() : source.hudless_view(),
+       kGuestOutputInternalLayout},
   };
-  VkWriteDescriptorSet writes[3] = {};
-  for (uint32_t j = 0; j < 3; ++j) {
+  VkWriteDescriptorSet writes[4] = {};
+  for (uint32_t j = 0; j < 4; ++j) {
     writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[j].dstSet = set;
     writes[j].dstBinding = j;
@@ -879,7 +882,7 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
         j == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[j].pImageInfo = &images[j];
   }
-  dfn.vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+  dfn.vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
   struct {
     uint32_t output_size[2];
     float output_size_inv[2];
@@ -3411,15 +3414,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                                 upscale_hud_composite_sets_.size()];
                 const VkSampler linear_sampler =
                     ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
-                VkDescriptorImageInfo composite_images[3] = {
+                VkDescriptorImageInfo composite_images[4] = {
                     {linear_sampler, source.view(), kGuestOutputInternalLayout},
+                    {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
+                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
                     {linear_sampler,
                      native_composite ? source.native_hud_view() : source.hudless_view(),
                      kGuestOutputInternalLayout},
-                    {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
                 };
-                VkWriteDescriptorSet composite_writes[3] = {};
-                for (uint32_t j = 0; j < 3; ++j) {
+                VkWriteDescriptorSet composite_writes[4] = {};
+                for (uint32_t j = 0; j < 4; ++j) {
                   composite_writes[j].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                   composite_writes[j].dstSet = composite_set;
                   composite_writes[j].dstBinding = j;
@@ -3429,7 +3433,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                              : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                   composite_writes[j].pImageInfo = &composite_images[j];
                 }
-                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 3, composite_writes, 0,
+                dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 4, composite_writes, 0,
                                            nullptr);
                 struct {
                   uint32_t output_size[2];

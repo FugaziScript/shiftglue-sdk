@@ -395,6 +395,22 @@ bool VulkanPresenter::VulkanGuestOutputRefreshContext::hudless_ever_written_prev
   return guest_output_image_ && guest_output_image_->hudless_ever_written;
 }
 
+bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureNativeHudImage(uint32_t width,
+                                                                           uint32_t height) {
+  return guest_output_image_ && guest_output_image_->EnsureNativeHud(width, height);
+}
+
+VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::native_hud_image() const {
+  return guest_output_image_ ? guest_output_image_->native_hud_image() : VK_NULL_HANDLE;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetNativeHudWritten() {
+  if (guest_output_image_ && native_hud_written_out_ &&
+      guest_output_image_->native_hud_image() != VK_NULL_HANDLE) {
+    *native_hud_written_out_ = true;
+  }
+}
+
 void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHudlessWritten() {
   if (!guest_output_image_ || !hudless_written_out_ ||
       guest_output_image_->hudless_image() == VK_NULL_HANDLE) {
@@ -729,7 +745,8 @@ void VulkanPresenter::PaintContext::DestroyFrameGenerationHudLayer() {
 }
 
 bool VulkanPresenter::RecordFrameGenerationHudLayer(
-    VkCommandBuffer command_buffer, const GuestOutputImage& source, uint32_t output_width,
+    VkCommandBuffer command_buffer, const GuestOutputImage& source, bool native_hud,
+    uint32_t output_width,
     uint32_t output_height, uint32_t input_width, uint32_t input_height,
     uint64_t submission_index) {
   VulkanFrameGeneration* frame_generation = paint_context_.frame_generation.get();
@@ -847,7 +864,8 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
       ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
   VkDescriptorImageInfo images[3] = {
       {linear_sampler, source.view(), kGuestOutputInternalLayout},
-      {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
+      {linear_sampler, native_hud ? source.native_hud_view() : source.hudless_view(),
+       kGuestOutputInternalLayout},
       {VK_NULL_HANDLE, paint_context_.frame_generation_hud_views[hud_index],
        VK_IMAGE_LAYOUT_GENERAL},
   };
@@ -866,10 +884,12 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
     uint32_t output_size[2];
     float output_size_inv[2];
     float source_uv_scale[2];
+    uint32_t native_hud;
   } constants = {{output_width, output_height},
                  {1.0f / float(output_width), 1.0f / float(output_height)},
                  {float(input_width) / float(source.extent().width),
-                  float(input_height) / float(source.extent().height)}};
+                  float(input_height) / float(source.extent().height)},
+                 uint32_t(native_hud)};
   dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                         upscale_hud_layer_pipeline_);
   dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1687,6 +1707,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         });
   }
 
+  rex::ui::SetPresentationHeight(paint_context_.swapchain_extent.height);
+
   // From now on, in case of failure,
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
@@ -1976,17 +1998,20 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   }
 
   bool hudless_written = false;
+  bool native_hud_written = false;
   bool camera_written = false;
   UpscalerCamera camera;
   VulkanGuestOutputRefreshContext context(
       is_8bpc_out_ref, image_instance.image->image(), image_instance.image->view(),
       image_instance.version, image_instance.ever_successfully_refreshed,
       image_instance.image.get(), &hudless_written, &camera, &camera_written);
+  context.set_native_hud_written_out(&native_hud_written);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
   image_instance.hudless_valid = refresher_succeeded && hudless_written;
+  image_instance.native_hud_valid = image_instance.hudless_valid && native_hud_written;
   image_instance.camera_valid = refresher_succeeded && camera_written;
   image_instance.camera = camera;
   // Deferred: the refresher's work reaches the queue later, and the step
@@ -2576,6 +2601,9 @@ VulkanPresenter::GuestOutputImage::~GuestOutputImage() {
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, hudless_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, native_hud_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, native_hud_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, native_hud_memory_);
   util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, depth_view_);
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, depth_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, depth_memory_);
@@ -2613,6 +2641,50 @@ bool VulkanPresenter::GuestOutputImage::EnsureHudless() {
   util::DestroyAndNullHandle(dfn.vkDestroyImage, device, hudless_image_);
   util::DestroyAndNullHandle(dfn.vkFreeMemory, device, hudless_memory_);
   return false;
+}
+
+bool VulkanPresenter::GuestOutputImage::EnsureNativeHud(uint32_t width, uint32_t height) {
+  if (native_hud_image_ != VK_NULL_HANDLE && native_hud_extent_.width == width &&
+      native_hud_extent_.height == height) {
+    return true;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  // A new presentation size: the refresh that asks is the image's own, so
+  // nothing reads the old one.
+  util::DestroyAndNullHandle(dfn.vkDestroyImageView, device, native_hud_view_);
+  util::DestroyAndNullHandle(dfn.vkDestroyImage, device, native_hud_image_);
+  util::DestroyAndNullHandle(dfn.vkFreeMemory, device, native_hud_memory_);
+  VkImageCreateInfo image_info = {};
+  image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  image_info.imageType = VK_IMAGE_TYPE_2D;
+  image_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+  image_info.extent = {width, height, 1};
+  image_info.mipLevels = 1;
+  image_info.arrayLayers = 1;
+  image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+  image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+  image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (!util::CreateDedicatedAllocationImage(vulkan_device_, image_info,
+                                            util::MemoryPurpose::kDeviceLocal, native_hud_image_,
+                                            native_hud_memory_)) {
+    return false;
+  }
+  VkImageViewCreateInfo view_info = {};
+  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_info.image = native_hud_image_;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = image_info.format;
+  view_info.subresourceRange = util::InitializeSubresourceRange();
+  if (dfn.vkCreateImageView(device, &view_info, nullptr, &native_hud_view_) != VK_SUCCESS) {
+    util::DestroyAndNullHandle(dfn.vkDestroyImage, device, native_hud_image_);
+    util::DestroyAndNullHandle(dfn.vkFreeMemory, device, native_hud_memory_);
+    return false;
+  }
+  native_hud_extent_ = {width, height};
+  return true;
 }
 
 bool VulkanPresenter::GuestOutputImage::EnsureCamera() {
@@ -2871,6 +2943,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   std::shared_ptr<GuestOutputImage> guest_output_image;
   uint64_t guest_output_refresh_serial = 0;
   bool guest_output_hudless = false;
+  bool guest_output_native_hud = false;
   bool guest_output_camera_valid = false;
   UpscalerCamera guest_output_camera;
   {
@@ -2882,6 +2955,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
+      guest_output_native_hud =
+          guest_output_images_[guest_output_mailbox_index].native_hud_valid;
       guest_output_camera_valid = guest_output_images_[guest_output_mailbox_index].camera_valid;
       guest_output_camera = guest_output_images_[guest_output_mailbox_index].camera;
     }
@@ -3309,12 +3384,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                                   (effect_rect_size.second + 7) / 8, 1);
               } else if (use_hudless && hud_mode == "composite" && EnsureUpscaleHudComposite() &&
                          RecordFrameGenerationHudLayer(
-                             draw_command_buffer, source, effect_rect_size.first,
+                             draw_command_buffer, source, guest_output_native_hud && i == 0,
+                             effect_rect_size.first,
                              effect_rect_size.second, effect_input_width, effect_input_height,
                              current_paint_submission_index)) {
                 // The HUD went into frame generation's layer: the frame stays
                 // without it.
               } else if (use_hudless && hud_mode == "composite" && EnsureUpscaleHudComposite()) {
+                const bool native_composite = guest_output_native_hud && i == 0;
                 VkImageMemoryBarrier barrier_to_composite = {};
                 barrier_to_composite.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 barrier_to_composite.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -3336,7 +3413,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                     ui_samplers_->samplers()[UISamplers::kSamplerIndexLinearClampToEdge];
                 VkDescriptorImageInfo composite_images[3] = {
                     {linear_sampler, source.view(), kGuestOutputInternalLayout},
-                    {linear_sampler, source.hudless_view(), kGuestOutputInternalLayout},
+                    {linear_sampler,
+                     native_composite ? source.native_hud_view() : source.hudless_view(),
+                     kGuestOutputInternalLayout},
                     {VK_NULL_HANDLE, output.view(), VK_IMAGE_LAYOUT_GENERAL},
                 };
                 VkWriteDescriptorSet composite_writes[3] = {};
@@ -3356,11 +3435,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                   uint32_t output_size[2];
                   float output_size_inv[2];
                   float source_uv_scale[2];
+                  uint32_t native_hud;
                 } composite_constants = {
                     {effect_rect_size.first, effect_rect_size.second},
                     {1.0f / float(effect_rect_size.first), 1.0f / float(effect_rect_size.second)},
                     {float(effect_input_width) / float(source.extent().width),
-                     float(effect_input_height) / float(source.extent().height)}};
+                     float(effect_input_height) / float(source.extent().height)},
+                    uint32_t(native_composite)};
                 dfn.vkCmdBindPipeline(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       upscale_hud_composite_pipeline_);
                 dfn.vkCmdBindDescriptorSets(draw_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,

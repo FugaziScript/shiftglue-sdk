@@ -140,6 +140,17 @@ class VulkanPresenter final : public Presenter {
     bool hudless_ever_written_previously() const;
     void SetHudlessWritten();
 
+    // fh1_native_hud: the HUD drawn at the presentation's resolution
+    // (VK_FORMAT_R16G16B16A16_SFLOAT, premultiplied, coverage in alpha), of
+    // its own size; released to kGuestOutputInternal* like the guest output.
+    // Painting takes it for the HUD after SetNativeHudWritten.
+    bool EnsureNativeHudImage(uint32_t width, uint32_t height);
+    VkImage native_hud_image() const;
+    void SetNativeHudWritten();
+    void set_native_hud_written_out(bool* native_hud_written_out) {
+      native_hud_written_out_ = native_hud_written_out;
+    }
+
     // UP-1.3 and UP-1.4, when WantsGuestOutputCamera: the scene depth (guest
     // z in [0, 1], kGuestOutputDepthFormat), the motion of each pixel to its
     // place in the previous frame (in UV units, kGuestOutputMotionFormat) and
@@ -163,6 +174,7 @@ class VulkanPresenter final : public Presenter {
     bool image_ever_written_previously_;
     GuestOutputImage* guest_output_image_;
     bool* hudless_written_out_;
+    bool* native_hud_written_out_ = nullptr;
     UpscalerCamera* camera_out_;
     bool* camera_written_out_;
   };
@@ -256,6 +268,10 @@ class VulkanPresenter final : public Presenter {
     VkImage hudless_image() const { return hudless_image_; }
     VkImageView hudless_view() const { return hudless_view_; }
     bool hudless_ever_written = false;
+    // The native HUD (VulkanGuestOutputRefreshContext::EnsureNativeHudImage).
+    bool EnsureNativeHud(uint32_t width, uint32_t height);
+    VkImage native_hud_image() const { return native_hud_image_; }
+    VkImageView native_hud_view() const { return native_hud_view_; }
     // The camera images (VulkanGuestOutputRefreshContext::EnsureCameraImages).
     bool EnsureCamera();
     VkImage depth_image() const { return depth_image_; }
@@ -293,6 +309,10 @@ class VulkanPresenter final : public Presenter {
     VkImage hudless_image_ = VK_NULL_HANDLE;
     VkDeviceMemory hudless_memory_ = VK_NULL_HANDLE;
     VkImageView hudless_view_ = VK_NULL_HANDLE;
+    VkImage native_hud_image_ = VK_NULL_HANDLE;
+    VkDeviceMemory native_hud_memory_ = VK_NULL_HANDLE;
+    VkImageView native_hud_view_ = VK_NULL_HANDLE;
+    VkExtent2D native_hud_extent_ = {};
     VkImage depth_image_ = VK_NULL_HANDLE;
     VkDeviceMemory depth_memory_ = VK_NULL_HANDLE;
     VkImageView depth_view_ = VK_NULL_HANDLE;
@@ -314,6 +334,7 @@ class VulkanPresenter final : public Presenter {
     // Whether that refresh also wrote the HUD-less copy, and the camera
     // images with this camera.
     bool hudless_valid = false;
+    bool native_hud_valid = false;
     bool camera_valid = false;
     UpscalerCamera camera;
     uint64_t last_refresher_submission = 0;
@@ -777,7 +798,8 @@ class VulkanPresenter final : public Presenter {
   // HUD layer in place of upscale_hud_composite; false if the HUD should be
   // composited into the frame instead.
   bool RecordFrameGenerationHudLayer(VkCommandBuffer command_buffer,
-                                     const GuestOutputImage& source, uint32_t output_width,
+                                     const GuestOutputImage& source, bool native_hud,
+                                     uint32_t output_width,
                                      uint32_t output_height, uint32_t input_width,
                                      uint32_t input_height, uint64_t submission_index);
   bool upscale_hud_composite_failed_ = false;

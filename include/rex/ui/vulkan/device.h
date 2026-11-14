@@ -277,6 +277,8 @@ class VulkanDevice {
     // Has optional features not implied by this being true.
     bool ext_KHR_compute_shader_derivatives = false;
     // Has optional features not implied by this being true.
+    bool ext_EXT_shader_image_atomic_int64 = false;
+    // Has optional features not implied by this being true.
     bool ext_EXT_device_fault = false;  // #342
     // Only with vulkan_device_address_bindings.
     bool ext_EXT_device_address_binding_report = false;  // #355

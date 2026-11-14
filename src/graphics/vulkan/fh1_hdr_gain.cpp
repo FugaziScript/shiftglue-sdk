@@ -9,9 +9,12 @@
 // (fsr4-patch/hdr/POST_CHAIN.md). At that draw this pass reads the same inputs - the scene, the
 // bloom, the eye adaptation's average luminance and the curve's constants - and writes, per
 // pixel, how much brighter than the game's SDR picture the pixel is on an HDR display: 1 up
-// to a knee, then the scene's own brightness rolled off towards the display's peak. The
-// presenter multiplies the decoded SDR picture by it (hdr_output.ps.glsl), so the game's
-// grading, saturation, upscaling and HUD stay as they are.
+// to a knee, then the scene's own brightness rolled off towards the display's peak. The map is
+// RGBA16F, hdr = (sdr + a) * rgb - a per channel with a = 0 here (hdr_output.ps.glsl): the
+// HDR pass applies it to the decoded SDR picture, or, with a temporal upscaler,
+// EncodeHudlessHdr applies it to the HUD-less copy the upscaler reads
+// (rex/ui/vulkan/hdr_scene_encoding.h). The game's grading, saturation and HUD stay as they
+// are.
 
 #include <rex/graphics/vulkan/fh1_native_executor.h>
 
@@ -47,14 +50,14 @@ layout(push_constant) uniform HdrGainConstants {
   float gamma;
   float peak;
   uvec2 size;
-  // The game's SDR brightness (after its curve, 0 to 1) where the expansion starts.
+  // The game's SDR brightness (after its curve, 0 to 1) where the gain starts.
   float knee;
 } c;
 // The texture cache's views of 2D textures are 2D arrays.
 layout(set = 0, binding = 0) uniform texture2DArray scene;
 layout(set = 0, binding = 1) uniform texture2DArray bloom;
 layout(set = 0, binding = 2) uniform texture2DArray luminance;
-layout(set = 0, binding = 3, r16f) writeonly uniform image2D gain;
+layout(set = 0, binding = 3, rgba16f) writeonly uniform image2D gain;
 
 float Hable(float x) {
   float a = c.wabc.y, b = c.wabc.z, cc = c.wabc.w;
@@ -106,7 +109,7 @@ void main() {
   vec3 s = Bilinear(scene, uv * c.scene_map.xy + c.scene_map.zw) * c.scene_scale;
   vec3 b = Bilinear(bloom, uv * c.bloom_map.xy + c.bloom_map.zw) * c.bloom_scale;
   vec3 x = (s * s + b * b) * Exposure();
-  // Mostly the largest channel, as present_hdr's expansion: coloured lights expand too.
+  // Mostly the largest channel: coloured lights (red brake lights) brighten too.
   float y = mix(dot(x, vec3(0.2126, 0.7152, 0.0722)), max(x.r, max(x.g, x.b)), 0.75);
   float sdr = Curve(y);
   float result = 1.0;
@@ -126,11 +129,154 @@ void main() {
     // In the display's decoding: the SDR picture is the curve's square root.
     result = pow(max(hdr, sdr) / max(sdr, 1.0e-4), 0.5 * c.gamma);
   }
-  imageStore(gain, ivec2(pixel), vec4(result, 0.0, 0.0, 0.0));
+  imageStore(gain, ivec2(pixel), vec4(vec3(result), 0.0));
+}
+)";
+
+const char* const kHdrEncodeSource = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform HdrEncodeConstants {
+  uvec2 size;
+  float gamma;      // The HDR pass's decoding: 0 piecewise sRGB, otherwise a power.
+  float knee;       // rex/ui/vulkan/hdr_scene_encoding.h.
+  float peak;
+  float log_scale;
+} c;
+layout(set = 0, binding = 0, rgb10_a2) uniform image2D hudless;
+layout(set = 0, binding = 1) uniform texture2D hdr_map;
+
+vec3 Decode(vec3 code) {
+  if (c.gamma > 0.0) return pow(code, vec3(c.gamma));
+  return mix(pow((code + 0.055) / 1.055, vec3(2.4)), code / 12.92,
+             lessThanEqual(code, vec3(0.04045)));
+}
+vec3 Encode(vec3 v) {
+  v = clamp(v, 0.0, 1.0);
+  if (c.gamma > 0.0) return pow(v, vec3(1.0 / c.gamma));
+  return mix(1.055 * pow(v, vec3(1.0 / 2.4)) - 0.055, v * 12.92,
+             lessThanEqual(v, vec3(0.0031308)));
+}
+
+// The HDR map over the whole guest output, as the HDR pass samples it.
+vec4 Map(vec2 uv) {
+  ivec2 size = textureSize(hdr_map, 0);
+  vec2 p = uv * vec2(size) - 0.5;
+  ivec2 i = ivec2(floor(p));
+  vec2 f = p - vec2(i);
+  ivec2 last = size - 1;
+  vec4 a = texelFetch(hdr_map, clamp(i, ivec2(0), last), 0);
+  vec4 b = texelFetch(hdr_map, clamp(i + ivec2(1, 0), ivec2(0), last), 0);
+  vec4 d = texelFetch(hdr_map, clamp(i + ivec2(0, 1), ivec2(0), last), 0);
+  vec4 e = texelFetch(hdr_map, clamp(i + ivec2(1, 1), ivec2(0), last), 0);
+  return mix(mix(a, b, f.x), mix(d, e, f.x), f.y);
+}
+
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, c.size))) return;
+  vec4 code = imageLoad(hudless, ivec2(pixel));
+  vec3 sdr = Decode(code.rgb);
+  vec4 map = Map((vec2(pixel) + 0.5) / vec2(c.size));
+  vec3 hdr = max((sdr + map.a) * map.rgb - map.a, vec3(0.0));
+  vec3 e = hdr;
+  if (c.peak > 1.0) {
+    float span = log(1.0 + (c.peak - c.knee) * c.log_scale);
+    vec3 above = c.knee + (1.0 - c.knee) *
+        log(1.0 + (min(hdr, vec3(c.peak)) - c.knee) * c.log_scale) / span;
+    e = mix(hdr, above, greaterThan(hdr, vec3(c.knee)));
+  }
+  imageStore(hudless, ivec2(pixel), vec4(Encode(e), code.a));
 }
 )";
 
 }  // namespace
+
+bool Fh1NativeExecutor::EncodeHudlessHdr(VkImageView hudless, VkImageView hdr_map,
+                                         uint32_t width, uint32_t height, float gamma,
+                                         float knee, float peak, float log_scale) {
+  if (!initialized_ || !hudless || !hdr_map || !width || !height) return false;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (hdr_encode_pipeline_ == VK_NULL_HANDLE) {
+    if (hdr_encode_failed_) return false;
+    hdr_encode_failed_ = true;
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    for (uint32_t i = 0; i < 2; ++i) {
+      bindings[i].binding = i;
+      bindings[i].descriptorType =
+          i == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      bindings[i].descriptorCount = 1;
+      bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+    set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_layout_info.bindingCount = 2;
+    set_layout_info.pBindings = bindings;
+    if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                        &hdr_encode_set_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    VkPushConstantRange range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+    VkPipelineLayoutCreateInfo layout_info = {};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &hdr_encode_set_layout_;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &range;
+    if (dfn.vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                   &hdr_encode_pipeline_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kHdrEncodeSource,
+                                               spirv, error)) {
+      REXGPU_WARN("Failed to compile the HDR scene encoding shader: {}", error);
+      return false;
+    }
+    hdr_encode_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        vulkan_device, hdr_encode_pipeline_layout_, spirv.data(),
+        spirv.size() * sizeof(uint32_t));
+    if (hdr_encode_pipeline_ == VK_NULL_HANDLE) return false;
+    hdr_encode_failed_ = false;
+  }
+  const VkDescriptorSet set = AllocateDescriptorSet(hdr_encode_set_layout_);
+  if (set == VK_NULL_HANDLE) {
+    Skip("hdr_encode_descriptor");
+    return false;
+  }
+  VkDescriptorImageInfo images[2] = {
+      {VK_NULL_HANDLE, hudless, VK_IMAGE_LAYOUT_GENERAL},
+      {VK_NULL_HANDLE, hdr_map, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+  };
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType =
+        i == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+  struct {
+    uint32_t size[2];
+    float gamma, knee, peak, log_scale;
+  } constants = {{width, height}, gamma, knee, peak, log_scale};
+  static_assert(sizeof(constants) == 24);
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         hdr_encode_pipeline_layout_, 0, 1, &set, 0, nullptr);
+  command_buffer.CmdVkPushConstants(hdr_encode_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                                    0, sizeof(constants), &constants);
+  command_processor_.BindExternalComputePipeline(hdr_encode_pipeline_);
+  command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  Count("hdr_encode");
+  return true;
+}
 
 bool Fh1NativeExecutor::EnsureHdrGainPipeline() {
   if (hdr_gain_pipeline_ != VK_NULL_HANDLE) return true;
@@ -213,7 +359,7 @@ void Fh1NativeExecutor::CaptureHdrGain(const HdrGainInputs& inputs) {
     VkImageCreateInfo image_info = {};
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     image_info.imageType = VK_IMAGE_TYPE_2D;
-    image_info.format = VK_FORMAT_R16_SFLOAT;
+    image_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     image_info.extent = {width, height, 1};
     image_info.mipLevels = 1;
     image_info.arrayLayers = 1;
@@ -233,14 +379,14 @@ void Fh1NativeExecutor::CaptureHdrGain(const HdrGainInputs& inputs) {
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view_info.image = hdr_gain_.image;
     view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_info.format = VK_FORMAT_R16_SFLOAT;
+    view_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (dfn.vkCreateImageView(device, &view_info, nullptr, &hdr_gain_.view) != VK_SUCCESS) {
       DestroyHdrGainImage();
       Skip("hdr_gain_create");
       return;
     }
-    hdr_gain_.format = VK_FORMAT_R16_SFLOAT;
+    hdr_gain_.format = VK_FORMAT_R16G16B16A16_SFLOAT;
     hdr_gain_.width = width;
     hdr_gain_.height = height;
   }

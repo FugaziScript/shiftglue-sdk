@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/ui/vulkan/hdr_scene_encoding.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -125,16 +126,8 @@ REXCVAR_DEFINE_DOUBLE(present_hdr_paper_white_nits, 200.0, "UI/Presenter",
 
 REXCVAR_DEFINE_DOUBLE(present_hdr_peak_nits, 1000.0, "UI/Presenter",
                       "The display's peak brightness on an HDR swapchain, in nits (the HDR "
-                      "calibration's last step); at or below the paper white nothing is "
-                      "expanded")
+                      "calibration's last step); the scene's highlights reach it")
     .range(80.0, 10000.0)
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
-REXCVAR_DEFINE_DOUBLE(present_hdr_highlights, 0.5, "UI/Presenter",
-                      "How far SDR white in the scene is expanded from the paper white towards "
-                      "present_hdr_peak_nits on an HDR swapchain (0 to 1); the HUD and menus "
-                      "stay at the paper white")
-    .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_DOUBLE(present_hdr_gamma, 2.2, "UI/Presenter",
@@ -155,16 +148,29 @@ REXCVAR_DEFINE_INT32(present_hdr_test_pattern, 0, "UI/Presenter",
     .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(present_hdr_native, true, "UI/Presenter",
-                    "With present_hdr, FM4's HDR from its own float scene (fh1_hdr_gain.cpp): "
-                    "the game's highlights reach present_hdr_peak_nits instead of the SDR "
-                    "picture being expanded; false expands the SDR picture as before")
-    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-
 REXCVAR_DEFINE_DOUBLE(present_hdr_native_knee, 0.5, "UI/Presenter",
                       "present_hdr_native: the game's SDR brightness (0 to 1, after its tone "
                       "curve, linear) above which pixels get brighter than SDR")
     .range(0.1, 0.95)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_hdr_upscale_hdr, true, "UI/Presenter",
+                    "present_hdr_native with a temporal upscaler (FSR, DLSS): the upscaler works "
+                    "on the HDR picture (encoded in its 10-bit input, logarithmic above half the "
+                    "paper white) instead of the SDR one with the HDR applied after it")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(present_hdr_shadow_lift, 0, "UI/Presenter",
+                     "On an HDR swapchain, lift the deepest shadows (cockpits, tunnels) by this "
+                     "many hundredths of a stop, fading out above 1 % of the paper white: mid "
+                     "grey moves a few percent, the highlights not at all, unlike a lower gamma")
+    .range(0, 400)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(present_hdr_debug_nits, false, "UI/Presenter",
+                    "On an HDR swapchain, show the picture's brightness in bands of colour: grey "
+                    "below 100 nits, blue to 200, green to 400, yellow to 600, orange to 800, red "
+                    "above (bind_hdr_debug_nits)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
@@ -192,11 +198,9 @@ namespace {
 // hdr_output.ps.glsl's push constants, after the rectangle constants.
 struct HdrOutputConstants {
   float paper_white_scale;
-  float highlight_scale;
-  float knee;
-  float knee_range_inv;
+  float reserved0[3];
   float gamma;
-  float max_channel_weight;
+  float reserved1;
   float compare_x;
   uint32_t pattern;
   float pattern_value;
@@ -207,9 +211,15 @@ struct HdrOutputConstants {
   float gain_offset[2];
   float gain_size_inv[2];
   uint32_t gain_enabled;
-  uint32_t gain_padding[3];
+  // The upscale holds the HDR scene (hdr_scene_encoding.h), which replaces the gain map.
+  uint32_t scene_encoded;
+  float scene_knee;
+  float scene_peak;
+  float scene_log_scale;
+  float shadow_lift;
+  uint32_t scene_padding[2];
 };
-static_assert(sizeof(HdrOutputConstants) == 80);
+static_assert(sizeof(HdrOutputConstants) == 96);
 
 // The active HDR swapchain is HDR10 (BT.2020 PQ), not scRGB.
 std::atomic<bool> hdr_output_pq = false;
@@ -430,6 +440,14 @@ bool VulkanPresenter::VulkanGuestOutputRefreshContext::EnsureHdrGainImage(uint32
 
 VkImage VulkanPresenter::VulkanGuestOutputRefreshContext::hdr_gain_image() const {
   return guest_output_image_ ? guest_output_image_->hdr_gain_image() : VK_NULL_HANDLE;
+}
+
+VkImageView VulkanPresenter::VulkanGuestOutputRefreshContext::hdr_gain_view() const {
+  return guest_output_image_ ? guest_output_image_->hdr_gain_view() : VK_NULL_HANDLE;
+}
+
+void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHudlessHdrWritten() {
+  if (hudless_hdr_written_out_) *hudless_hdr_written_out_ = true;
 }
 
 void VulkanPresenter::VulkanGuestOutputRefreshContext::SetHdrGainWritten() {
@@ -2073,6 +2091,7 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   bool hudless_written = false;
   bool native_hud_written = false;
   bool hdr_gain_written = false;
+  bool hudless_hdr_written = false;
   bool camera_written = false;
   UpscalerCamera camera;
   VulkanGuestOutputRefreshContext context(
@@ -2081,6 +2100,7 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
       image_instance.image.get(), &hudless_written, &camera, &camera_written);
   context.set_native_hud_written_out(&native_hud_written);
   context.set_hdr_gain_written_out(&hdr_gain_written);
+  context.set_hudless_hdr_written_out(&hudless_hdr_written);
   bool refresher_succeeded = refresher(context);
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
@@ -2088,6 +2108,7 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   image_instance.hudless_valid = refresher_succeeded && hudless_written;
   image_instance.native_hud_valid = image_instance.hudless_valid && native_hud_written;
   image_instance.hdr_gain_valid = refresher_succeeded && hdr_gain_written;
+  image_instance.hudless_hdr_valid = image_instance.hudless_valid && hudless_hdr_written;
   image_instance.camera_valid = refresher_succeeded && camera_written;
   image_instance.camera = camera;
   // Deferred: the refresher's work reaches the queue later, and the step
@@ -2780,7 +2801,7 @@ bool VulkanPresenter::GuestOutputImage::EnsureHdrGain(uint32_t width, uint32_t h
   VkImageCreateInfo image_info = {};
   image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   image_info.imageType = VK_IMAGE_TYPE_2D;
-  image_info.format = VK_FORMAT_R16_SFLOAT;
+  image_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
   image_info.extent = {width, height, 1};
   image_info.mipLevels = 1;
   image_info.arrayLayers = 1;
@@ -3067,6 +3088,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   bool guest_output_hudless = false;
   bool guest_output_native_hud = false;
   bool guest_output_hdr_gain = false;
+  bool guest_output_hudless_hdr = false;
+  // Whether the temporal upscale painted this time read the HUD-less copy holding the HDR scene.
+  bool scene_hdr_encoded = false;
   // present_hdr_native: the final effect's rectangle in the stand-in.
   BilinearConstants hdr_gain_rect = {};
   bool hdr_gain_rect_valid = false;
@@ -3081,6 +3105,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
       guest_output_refresh_serial = guest_output_images_[guest_output_mailbox_index].refresh_serial;
       guest_output_hudless = guest_output_images_[guest_output_mailbox_index].hudless_valid;
+      guest_output_hudless_hdr =
+          guest_output_images_[guest_output_mailbox_index].hudless_hdr_valid;
       guest_output_native_hud =
           guest_output_images_[guest_output_mailbox_index].native_hud_valid;
       guest_output_hdr_gain = guest_output_images_[guest_output_mailbox_index].hdr_gain_valid;
@@ -3408,6 +3434,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 temporal_upscale_.output_width == effect_rect_size.first &&
                 temporal_upscale_.output_height == effect_rect_size.second) {
               ++temporal_upscale_.repeat_count;
+              scene_hdr_encoded = use_hudless && guest_output_hudless_hdr;
               continue;
             }
 
@@ -3437,6 +3464,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 use_camera ? &source : nullptr, use_camera ? &guest_output_camera : nullptr);
             paint_checkpoint(2);
             if (upscaled) {
+              scene_hdr_encoded = use_hudless && guest_output_hudless_hdr;
               // Until a branch below moves the HUD into frame generation's
               // layer, it is in the upscaled frame.
               paint_context_.frame_generation_hud_in_layer = false;
@@ -3911,8 +3939,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   if (paint_context_.swapchain_hdr) {
     // The SDR stand-in, guest output and UI included, to the scRGB swapchain:
     // sampled through its sRGB view as linear, and scaled so that white is the
-    // paper white (scRGB 1.0 is 80 nits), the scene's highlights expanded
-    // towards present_hdr_peak_nits where the alpha says it is not UI.
+    // paper white (scRGB 1.0 is 80 nits), the scene's highlights from FM4's own float scene
+    // (fh1_hdr_gain.cpp) towards present_hdr_peak_nits where the alpha says it is not UI.
     const PaintContext::HdrImage& hdr_image = paint_context_.hdr_images[swapchain_image_index];
     VkRenderPassBeginInfo hdr_render_pass_begin_info = {};
     hdr_render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -3936,7 +3964,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // present_hdr_native: set 1 is the painted guest output's HDR gain map, or the stand-in
     // again (unread) without one.
     const bool hdr_gain_sets_ready = EnsureHdrGainSets();
-    const bool hdr_gain = hdr_gain_sets_ready && REXCVAR_GET(present_hdr_native) &&
+    const bool hdr_gain = hdr_gain_sets_ready && !scene_hdr_encoded &&
                           guest_output_hdr_gain && guest_output_image &&
                           guest_output_image->hdr_gain_view() != VK_NULL_HANDLE &&
                           hdr_gain_rect_valid;
@@ -3967,17 +3995,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     const double paper_white_nits = REXCVAR_GET(present_hdr_paper_white_nits);
     const double peak_nits = REXCVAR_GET(present_hdr_peak_nits);
     hdr_constants.paper_white_scale = float(paper_white_nits / 80.0);
-    // SDR white in the scene goes this far from the paper white to the peak.
-    hdr_constants.highlight_scale = float(
-        std::max(peak_nits / paper_white_nits - 1.0, 0.0) *
-        std::clamp(REXCVAR_GET(present_hdr_highlights), 0.0, 1.0));
-    // Linear SDR brightness where the expansion starts (0.5 is 73 % in sRGB).
-    hdr_constants.knee = 0.5f;
-    hdr_constants.knee_range_inv = 1.0f / (1.0f - hdr_constants.knee);
     hdr_constants.gamma = float(REXCVAR_GET(present_hdr_gamma));
-    // Mostly the largest channel: a red brake light (luminance 0.21) expands
-    // nearly as a white one; deep colored surfaces stay below the knee.
-    hdr_constants.max_channel_weight = 0.75f;
     hdr_constants.pattern = hdr_test_pattern;
     // Compare returns before drawing patterns in the shader; calibration must
     // cover both halves without changing the player's compare setting.
@@ -3997,7 +4015,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
     logged_pattern = hdr_constants;
     hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
-                                 (hdr_output_rotation.load(std::memory_order_relaxed) << 1);
+                                 (hdr_output_rotation.load(std::memory_order_relaxed) << 1) |
+                                 (REXCVAR_GET(present_hdr_debug_nits) ? 8 : 0);
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
     hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
     if (hdr_gain) {
@@ -4006,6 +4025,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       hdr_constants.gain_size_inv[0] = hdr_gain_rect.output_size_inv[0];
       hdr_constants.gain_size_inv[1] = hdr_gain_rect.output_size_inv[1];
       hdr_constants.gain_enabled = 1;
+    }
+    hdr_constants.shadow_lift =
+        float(std::exp2(std::clamp(REXCVAR_GET(present_hdr_shadow_lift), 0, 400) / 100.0) - 1.0);
+    if (scene_hdr_encoded) {
+      const HdrSceneEncoding encoding = MakeHdrSceneEncoding(peak_nits, paper_white_nits);
+      hdr_constants.scene_encoded = 1;
+      hdr_constants.scene_knee = encoding.knee;
+      hdr_constants.scene_peak = encoding.peak;
+      hdr_constants.scene_log_scale = encoding.log_scale;
     }
     dfn.vkCmdPushConstants(draw_command_buffer, hdr_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                            sizeof(hdr_rect_constants), sizeof(hdr_constants), &hdr_constants);

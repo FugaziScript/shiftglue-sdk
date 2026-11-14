@@ -612,6 +612,16 @@ void Fh1NativeExecutor::Shutdown() {
   surfaces_.clear();
   DestroyHudSnapshot();
   DestroyHdrGainImage();
+  if (hdr_encode_pipeline_) dfn.vkDestroyPipeline(device, hdr_encode_pipeline_, nullptr);
+  if (hdr_encode_pipeline_layout_) {
+    dfn.vkDestroyPipelineLayout(device, hdr_encode_pipeline_layout_, nullptr);
+  }
+  if (hdr_encode_set_layout_) {
+    dfn.vkDestroyDescriptorSetLayout(device, hdr_encode_set_layout_, nullptr);
+  }
+  hdr_encode_pipeline_ = VK_NULL_HANDLE;
+  hdr_encode_pipeline_layout_ = VK_NULL_HANDLE;
+  hdr_encode_set_layout_ = VK_NULL_HANDLE;
   if (hdr_gain_pipeline_) dfn.vkDestroyPipeline(device, hdr_gain_pipeline_, nullptr);
   if (hdr_gain_pipeline_layout_) {
     dfn.vkDestroyPipelineLayout(device, hdr_gain_pipeline_layout_, nullptr);

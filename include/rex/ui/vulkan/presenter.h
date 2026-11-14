@@ -160,6 +160,13 @@ class VulkanPresenter final : public Presenter {
     void set_hdr_gain_written_out(bool* hdr_gain_written_out) {
       hdr_gain_written_out_ = hdr_gain_written_out;
     }
+    VkImageView hdr_gain_view() const;
+    // After the refresher wrote the HDR scene into the HUD-less copy (hdr_scene_encoding.h),
+    // after SetHudlessWritten: painting decodes the upscale of it as HDR.
+    void SetHudlessHdrWritten();
+    void set_hudless_hdr_written_out(bool* hudless_hdr_written_out) {
+      hudless_hdr_written_out_ = hudless_hdr_written_out;
+    }
 
     // UP-1.3 and UP-1.4, when WantsGuestOutputCamera: the scene depth (guest
     // z in [0, 1], kGuestOutputDepthFormat), the motion of each pixel to its
@@ -186,6 +193,7 @@ class VulkanPresenter final : public Presenter {
     bool* hudless_written_out_;
     bool* native_hud_written_out_ = nullptr;
     bool* hdr_gain_written_out_ = nullptr;
+    bool* hudless_hdr_written_out_ = nullptr;
     UpscalerCamera* camera_out_;
     bool* camera_written_out_;
   };
@@ -355,6 +363,8 @@ class VulkanPresenter final : public Presenter {
     bool hudless_valid = false;
     bool native_hud_valid = false;
     bool hdr_gain_valid = false;
+    // The HUD-less copy holds the HDR scene (hdr_scene_encoding.h).
+    bool hudless_hdr_valid = false;
     bool camera_valid = false;
     UpscalerCamera camera;
     uint64_t last_refresher_submission = 0;
@@ -369,6 +379,7 @@ class VulkanPresenter final : public Presenter {
       last_refresher_submission = 0;
       ever_successfully_refreshed = false;
       hudless_valid = false;
+      hudless_hdr_valid = false;
       camera_valid = false;
     }
   };

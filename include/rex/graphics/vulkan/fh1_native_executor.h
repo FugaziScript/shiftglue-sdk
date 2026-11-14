@@ -201,9 +201,16 @@ class Fh1NativeExecutor {
     HdrGainConstants constants = {};
   };
   void CaptureHdrGain(const HdrGainInputs& inputs);
-  // After OnSwap: the swapped frame's gain map (R16_SFLOAT) in TRANSFER_SRC_OPTIMAL once the
+  // After OnSwap: the swapped frame's HDR map (R16G16B16A16_SFLOAT: per channel, how the
+  // decoded SDR picture becomes HDR, hdr_output.ps.glsl) in TRANSFER_SRC_OPTIMAL once the
   // caller submits the barriers, or VK_NULL_HANDLE when the frame had no tonemap draw.
   VkImage TakeHdrGain(uint32_t& width_out, uint32_t& height_out);
+  // With a temporal upscaler: the HDR scene into the HUD-less guest output copy (storage,
+  // GENERAL, width x height), from its own SDR picture and the frame's HDR map (sampled,
+  // SHADER_READ_ONLY_OPTIMAL), encoded as rex/ui/vulkan/hdr_scene_encoding.h; its alpha is
+  // kept. gamma is present_hdr_gamma (0: piecewise sRGB). Returns whether it was recorded.
+  bool EncodeHudlessHdr(VkImageView hudless, VkImageView hdr_map, uint32_t width,
+                        uint32_t height, float gamma, float knee, float peak, float log_scale);
 
   // UP-1.3: the camera and depth a temporal upscaler needs (fh1_camera.cpp).
   // While enabled, every scene draw's world-view-projection (vertex float
@@ -768,6 +775,10 @@ class Fh1NativeExecutor {
   uint32_t camera_depth_wanted_height_ = 0;
   bool EnsureHdrGainPipeline();
   void DestroyHdrGainImage();
+  VkDescriptorSetLayout hdr_encode_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout hdr_encode_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline hdr_encode_pipeline_ = VK_NULL_HANDLE;
+  bool hdr_encode_failed_ = false;
   Surface hdr_gain_;
   bool hdr_gain_taken_ = false;
   bool hdr_gain_ready_ = false;

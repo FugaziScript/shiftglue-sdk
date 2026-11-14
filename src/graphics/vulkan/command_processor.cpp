@@ -61,6 +61,7 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/upscaler.h>
+#include <rex/ui/vulkan/hdr_scene_encoding.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -84,11 +85,11 @@ REXCVAR_DEFINE_INT32(unprotected_page_check_interval, 1, "GPU/Vulkan",
                      "vertex or texture data. Range-request checks remain enabled")
     .range(1, INT32_MAX)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-REXCVAR_DECLARE(bool, present_hdr_native);
 REXCVAR_DECLARE(double, present_hdr_native_knee);
 REXCVAR_DECLARE(double, present_hdr_paper_white_nits);
 REXCVAR_DECLARE(double, present_hdr_peak_nits);
 REXCVAR_DECLARE(double, present_hdr_gamma);
+REXCVAR_DECLARE(bool, present_hdr_upscale_hdr);
 
 REXCVAR_DECLARE(std::string, fh1_resolve_dump_dir);
 #if defined(REXGLUE_ENABLE_CS_PROBES)
@@ -4951,6 +4952,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
           }
 
           // present_hdr_native: the frame's HDR gain map (fh1_hdr_gain.cpp).
+          bool hdr_gain_copied = false;
           if (hdr_gain_image != VK_NULL_HANDLE &&
               vulkan_context.EnsureHdrGainImage(hdr_gain_width, hdr_gain_height)) {
             const VkImage hdr_gain_destination = vulkan_context.hdr_gain_image();
@@ -4975,6 +4977,47 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                    ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
             vulkan_context.SetHdrGainWritten();
+            hdr_gain_copied = true;
+          }
+
+          // present_hdr_native with a temporal upscaler: the HDR scene into the HUD-less copy
+          // the upscaler reads (rex/ui/vulkan/hdr_scene_encoding.h), so the upscaler works on
+          // the HDR picture and the HDR pass only decodes it.
+          if (hudless_written && hdr_gain_copied && hdr_active &&
+              REXCVAR_GET(present_hdr_upscale_hdr) &&
+              vulkan_context.hdr_gain_view() != VK_NULL_HANDLE) {
+            const VkImage hudless_image = vulkan_context.hudless_image();
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout,
+                                   VK_IMAGE_LAYOUT_GENERAL);
+            PushImageMemoryBarrier(vulkan_context.hdr_gain_image(), guest_output_subresource_range,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_ACCESS_SHADER_READ_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            SubmitBarriers(true);
+            const ui::vulkan::HdrSceneEncoding encoding = ui::vulkan::MakeHdrSceneEncoding(
+                REXCVAR_GET(present_hdr_peak_nits), REXCVAR_GET(present_hdr_paper_white_nits));
+            const bool encoded = fh1_native_executor_ &&
+                                 fh1_native_executor_->EncodeHudlessHdr(
+                                     vulkan_context.hudless_image_view(),
+                                     vulkan_context.hdr_gain_view(), guest_output_width,
+                                     guest_output_height, float(REXCVAR_GET(present_hdr_gamma)),
+                                     encoding.knee, encoding.peak, encoding.log_scale);
+            PushImageMemoryBarrier(hudless_image, guest_output_subresource_range,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
+                                   VK_ACCESS_SHADER_WRITE_BIT,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                   VK_IMAGE_LAYOUT_GENERAL,
+                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+            if (encoded) vulkan_context.SetHudlessHdrWritten();
           }
 
           // UP-1.3 and UP-1.4: the depth and camera motion beside it.
@@ -7852,7 +7895,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
     // to the HDR gain map.
     constexpr uint64_t kFm4TonemapPixelShader = 0xE97AA211B556A9B3ull;
     if (pixel_shader && pixel_shader->ucode_data_hash() == kFm4TonemapPixelShader &&
-        REXCVAR_GET(present_hdr_native) && ui::vulkan::GetHdrOutputState().active &&
+        ui::vulkan::GetHdrOutputState().active &&
         program_probe == 0) {
       Fh1NativeExecutor::HdrGainInputs gain;
       gain.scene = hdr_gain_views[0];

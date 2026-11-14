@@ -18,8 +18,13 @@ namespace rex::graphics {
 
 // The constant register writes (register index, value) that apply the settings to a draw
 // with these shaders, given the register file's values; none for any other draw.
+// vertex_float_bitmap and pixel_float_bitmap are the shaders' float constants read
+// (Shader::ConstantRegisterMap), or null: COCKPIT AMBIENT goes by what a shader reads rather
+// than by its hash.
 void Fm4LightingPatches(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash,
                         const uint32_t* registers,
-                        std::vector<std::pair<uint32_t, uint32_t>>& patches);
+                        std::vector<std::pair<uint32_t, uint32_t>>& patches,
+                        const uint64_t* vertex_float_bitmap = nullptr,
+                        const uint64_t* pixel_float_bitmap = nullptr);
 
 }  // namespace rex::graphics

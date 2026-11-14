@@ -3579,9 +3579,19 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
         std::vector<std::pair<uint32_t, uint32_t>> lighting_saved;
         if (active_pixel_shader_) {
           std::vector<std::pair<uint32_t, uint32_t>> lighting_patches;
+          const Shader::ConstantRegisterMap* vertex_constants =
+              active_vertex_shader_ ? &active_vertex_shader_->constant_register_map() : nullptr;
+          const Shader::ConstantRegisterMap& pixel_constants =
+              active_pixel_shader_->constant_register_map();
           Fm4LightingPatches(active_vertex_shader_ ? active_vertex_shader_->ucode_data_hash() : 0,
                              active_pixel_shader_->ucode_data_hash(), register_file_->values,
-                             lighting_patches);
+                             lighting_patches,
+                             vertex_constants && !vertex_constants->float_dynamic_addressing
+                                 ? vertex_constants->float_bitmap
+                                 : nullptr,
+                             pixel_constants.float_dynamic_addressing
+                                 ? nullptr
+                                 : pixel_constants.float_bitmap);
           for (const auto& [lighting_register, lighting_value] : lighting_patches) {
             lighting_saved.emplace_back(lighting_register,
                                         register_file_->values[lighting_register]);

@@ -52,6 +52,7 @@ constexpr uint64_t kTypeFrameGenerationConfigure = 0x00020002u;
 constexpr uint64_t kTypeFrameGenerationPrepareV2 = 0x0002000cu;
 constexpr uint64_t kTypeFrameGenerationVersion = 0x0002000eu;
 constexpr uint32_t kFrameGenerationVersion = (4u << 22) | (0u << 12) | 2u;
+constexpr uint32_t kFrameGenerationEnableHighDynamicRange = 1u << 5;
 constexpr uint32_t kFlagDrawDebugTearLines = 1u << 0;
 constexpr uint32_t kFlagDrawDebugResetIndicators = 1u << 1;
 constexpr uint32_t kFlagDrawDebugPacingLines = 1u << 4;
@@ -299,10 +300,14 @@ class VulkanFfxFrameGeneration final : public VulkanFrameGeneration {
     functions_.get_swapchain_images = functions_desc.get_swapchain_images;
     functions_.acquire_next_image = functions_desc.acquire_next_image;
     functions_.queue_present = functions_desc.queue_present;
+    functions_.set_hdr_metadata = functions_desc.set_hdr_metadata;
 
     FrameGenerationCreateDesc fg_desc = {};
     fg_desc.header.type = kTypeFrameGenerationCreate;
-    fg_desc.flags = 0;
+    // An HDR swapchain (present_hdr: scRGB or HDR10) presents HDR back buffers.
+    fg_desc.flags = create_info.imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+                        ? kFrameGenerationEnableHighDynamicRange
+                        : 0;
     fg_desc.displaySize = {create_info.imageExtent.width, create_info.imageExtent.height};
     fg_desc.maxRenderSize = fg_desc.displaySize;
     fg_desc.backBufferFormat = ffxApiGetSurfaceFormatVK(create_info.imageFormat);
@@ -332,8 +337,8 @@ class VulkanFfxFrameGeneration final : public VulkanFrameGeneration {
     if (ffx_.query(&fg_context, &provider.header) == FFX_API_RETURN_OK && provider.versionName) {
       version_ = provider.versionName;
     }
-    REXLOG_INFO("Frame generation: FSR frame generation {} on a {}x{} swapchain", version_,
-                display_width_, display_height_);
+    REXLOG_INFO("Frame generation: FSR frame generation {} on a {}x{} {} swapchain", version_,
+                display_width_, display_height_, fg_desc.flags ? "HDR" : "SDR");
     return true;
   }
 

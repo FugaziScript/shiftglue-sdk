@@ -50,6 +50,10 @@ const uint kRotation90 = 1u;
 const uint kRotation270 = 2u;
 // Bit 3: present_hdr_debug_nits, the picture's brightness in bands of colour.
 const uint kOutputNitsBands = 8u;
+// Bit 4: the guest output's HUD is frame generation's layer, put over the presented frames
+// after this pass (frame_generation_hud_compose_hdr.cs.glsl), and no host UI is drawn: no
+// pixel is UI.
+const uint kOutputHudInLayer = 16u;
 
 const uint kPatternNone = 0u;
 const uint kPatternBlack = 1u;
@@ -201,7 +205,7 @@ void main() {
   ivec2 pixel = StandInPixel(ivec2(gl_FragCoord.xy));
   vec2 frag = vec2(pixel) + 0.5;
   vec4 sdr = texelFetch(stand_in, pixel, 0);
-  float ui = clamp(sdr.a, 0.0, 1.0);
+  float ui = (constants.output_flags & kOutputHudInLayer) != 0u ? 0.0 : clamp(sdr.a, 0.0, 1.0);
   vec3 linear = sdr.rgb;
   if (constants.compare_x >= 0.0 && frag.x < constants.compare_x) {
     // The SDR reference half.

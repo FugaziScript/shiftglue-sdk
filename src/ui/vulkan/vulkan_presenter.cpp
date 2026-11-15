@@ -70,7 +70,7 @@ REXCVAR_DECLARE(bool, vulkan_diagnostic_checkpoints_serialize);
 REXCVAR_DEFINE_BOOL(present_frame_generation, false, "UI/Presenter",
                     "AMD FSR frame generation: an interpolated frame before each rendered one, "
                     "through AMD's frame generation swapchain (FidelityFX SDK 2.4 runtime). Runs "
-                    "with a temporal upscaler (FSR 2, 3 or 4) in SDR, presenting through the "
+                    "with a temporal upscaler (FSR 2, 3 or 4), presenting through the "
                     "Vulkan swapchain (not vulkan_present_via_dxgi); paused while host UI shows")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -265,6 +265,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/upscale_hud_composite_cs.h"
 #include "../shaders/vulkan_spirv/upscale_hud_layer_cs.h"
 #include "../shaders/vulkan_spirv/frame_generation_hud_compose_cs.h"
+#include "../shaders/vulkan_spirv/frame_generation_hud_compose_hdr_cs.h"
 }  // namespace shaders
 
 VulkanPresenter::PaintContext::Submission::~Submission() {
@@ -353,6 +354,8 @@ VulkanPresenter::~VulkanPresenter() {
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, upscale_hud_layer_pipeline_);
   paint_context_.DestroyFrameGenerationHudLayer();
   util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, frame_generation_compose_pipeline_);
+  util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                             frame_generation_compose_hdr_pipeline_);
   util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                              frame_generation_compose_pipeline_layout_);
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
@@ -664,7 +667,7 @@ bool VulkanPresenter::EnsureFrameGenerationCompose() {
     return false;
   }
   VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                             sizeof(uint32_t) * 4};
+                                             sizeof(uint32_t) * 8};
   VkPipelineLayoutCreateInfo pipeline_layout_info = {};
   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   pipeline_layout_info.setLayoutCount = 1;
@@ -702,7 +705,12 @@ bool VulkanPresenter::EnsureFrameGenerationCompose() {
   frame_generation_compose_pipeline_ = util::CreateComputePipeline(
       vulkan_device_, frame_generation_compose_pipeline_layout_,
       shaders::frame_generation_hud_compose_cs, sizeof(shaders::frame_generation_hud_compose_cs));
-  return frame_generation_compose_pipeline_ != VK_NULL_HANDLE;
+  frame_generation_compose_hdr_pipeline_ = util::CreateComputePipeline(
+      vulkan_device_, frame_generation_compose_pipeline_layout_,
+      shaders::frame_generation_hud_compose_hdr_cs,
+      sizeof(shaders::frame_generation_hud_compose_hdr_cs));
+  return frame_generation_compose_pipeline_ != VK_NULL_HANDLE &&
+         frame_generation_compose_hdr_pipeline_ != VK_NULL_HANDLE;
 }
 
 bool VulkanPresenter::ComposeFrameGenerationHud(
@@ -780,16 +788,23 @@ bool VulkanPresenter::ComposeFrameGenerationHud(
       writes[j].pImageInfo = &images[j];
     }
     dfn.vkUpdateDescriptorSets(vulkan_device_->device(), 2, writes, 0, nullptr);
+    // scRGB (present_hdr): the HUD at the paper white, as the HDR pass puts it.
+    const bool hdr = paint_context_.frame_generation_compose_format == PaintContext::kHdrFormat;
     struct {
       uint32_t size[2];
       uint32_t swap_red_blue;
-      uint32_t padding;
+      float paper_white_scale;
+      float gamma;
+      uint32_t padding[3];
     } constants = {{width, height},
                    uint32_t(paint_context_.frame_generation_compose_format ==
                             VK_FORMAT_B8G8R8A8_UNORM),
-                   0};
+                   float(REXCVAR_GET(present_hdr_paper_white_nits) / 80.0),
+                   float(REXCVAR_GET(present_hdr_gamma)),
+                   {}};
     dfn.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          frame_generation_compose_pipeline_);
+                          hdr ? frame_generation_compose_hdr_pipeline_
+                              : frame_generation_compose_pipeline_);
     dfn.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 frame_generation_compose_pipeline_layout_, 0, 1, &set, 0, nullptr);
     dfn.vkCmdPushConstants(command_buffer, frame_generation_compose_pipeline_layout_,
@@ -848,10 +863,13 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
     return false;
   }
   // The present callback copies the frame and writes over it through an
-  // RGBA8 view, so the swapchain must have an 8-bit RGBA or BGRA format.
-  const VkFormat compose_format = paint_context_.swapchain_render_pass_format;
+  // RGBA8 view, so the swapchain must have an 8-bit RGBA or BGRA format, or
+  // be scRGB (present_hdr), written through an RGBA16F view.
+  const VkFormat compose_format = paint_context_.swapchain_hdr
+                                      ? paint_context_.hdr_render_pass_format
+                                      : paint_context_.swapchain_render_pass_format;
   if ((compose_format != VK_FORMAT_B8G8R8A8_UNORM &&
-       compose_format != VK_FORMAT_R8G8B8A8_UNORM) ||
+       compose_format != VK_FORMAT_R8G8B8A8_UNORM && compose_format != PaintContext::kHdrFormat) ||
       !EnsureFrameGenerationCompose()) {
     return false;
   }
@@ -916,7 +934,8 @@ bool VulkanPresenter::RecordFrameGenerationHudLayer(
       view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
       view_info.image = paint_context_.frame_generation_compose_images[i];
       view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+      view_info.format =
+          compose_format == PaintContext::kHdrFormat ? compose_format : VK_FORMAT_R8G8B8A8_UNORM;
       view_info.subresourceRange = util::InitializeSubresourceRange();
       if (dfn.vkCreateImageView(device, &view_info, nullptr,
                                 &paint_context_.frame_generation_compose_views[i]) != VK_SUCCESS) {
@@ -1756,7 +1775,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // present_frame_generation: hand the swapchain to AMD's frame generation
   // swapchain, which replaces it. If that fails, present without it for the
   // rest of the session.
-  if (!presenting_via_dxgi && frame_generation_wanted && !paint_context_.swapchain_hdr &&
+  if (!presenting_via_dxgi && frame_generation_wanted &&
       paint_context_.swapchain != VK_NULL_HANDLE) {
     if (!paint_context_.frame_generation) {
       const char* reason = nullptr;
@@ -1804,8 +1823,16 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
   // returning.
 
-  if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed) &&
-      vulkan_device_->extensions().ext_EXT_hdr_metadata) {
+  // Frame generation on an HDR swapchain, scRGB included, takes the luminance range it
+  // normalises its optical flow input by from the swapchain's metadata: without any, its
+  // generated frames flicker in colour.
+  const bool frame_generation_hdr =
+      paint_context_.swapchain_hdr && paint_context_.frame_generation &&
+      paint_context_.frame_generation->wraps_swapchain() &&
+      paint_context_.frame_generation->swapchain_functions().set_hdr_metadata;
+  if (frame_generation_hdr ||
+      (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed) &&
+       vulkan_device_->extensions().ext_EXT_hdr_metadata)) {
     // Mastered for the display itself, so that it shows the levels as they
     // are, clipping at its own peak, rather than tone-mapping them from an
     // assumed 1000-10000 nit master (which flattened the whole image on the
@@ -1833,9 +1860,15 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     metadata.minLuminance = min_nits;
     metadata.maxContentLightLevel = max_nits;
     metadata.maxFrameAverageLightLevel = max_average_nits;
-    vulkan_device_->functions().vkSetHdrMetadataEXT(device, 1, &paint_context_.swapchain,
-                                                    &metadata);
-    REXLOG_INFO("VulkanPresenter: HDR10 metadata: peak {} nits, frame average {} nits, black {} nits",
+    // A frame generation swapchain is the runtime's, set through its own function.
+    const PFN_vkSetHdrMetadataEXT set_hdr_metadata =
+        paint_context_.frame_generation && paint_context_.frame_generation->wraps_swapchain()
+            ? paint_context_.frame_generation->swapchain_functions().set_hdr_metadata
+            : vulkan_device_->functions().vkSetHdrMetadataEXT;
+    if (set_hdr_metadata) {
+      set_hdr_metadata(device, 1, &paint_context_.swapchain, &metadata);
+    }
+    REXLOG_INFO("VulkanPresenter: HDR metadata: peak {} nits, frame average {} nits, black {} nits",
                 max_nits, max_average_nits, min_nits);
   } else if (paint_context_.swapchain_hdr && hdr_output_pq.load(std::memory_order_relaxed)) {
     REXLOG_WARN("VulkanPresenter: HDR10 without metadata (no VK_EXT_hdr_metadata)");
@@ -4016,7 +4049,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     logged_pattern = hdr_constants;
     hdr_constants.output_flags = (hdr_output_pq.load(std::memory_order_relaxed) ? 1 : 0) |
                                  (hdr_output_rotation.load(std::memory_order_relaxed) << 1) |
-                                 (REXCVAR_GET(present_hdr_debug_nits) ? 8 : 0);
+                                 (REXCVAR_GET(present_hdr_debug_nits) ? 8 : 0) |
+                                 // The HUD is frame generation's layer, composed after this pass,
+                                 // and no host UI is drawn: the stand-in's alpha (the guest
+                                 // output's HUD coverage) is no UI here.
+                                 (paint_context_.frame_generation &&
+                                          paint_context_.frame_generation_hud_in_layer
+                                      ? 16
+                                      : 0);
     hdr_constants.size[0] = float(paint_context_.swapchain_extent.width);
     hdr_constants.size[1] = float(paint_context_.swapchain_extent.height);
     if (hdr_gain) {

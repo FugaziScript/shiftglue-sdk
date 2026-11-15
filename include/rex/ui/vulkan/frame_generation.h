@@ -45,6 +45,8 @@ class VulkanFrameGeneration {
     PFN_vkGetSwapchainImagesKHR get_swapchain_images = nullptr;
     PFN_vkAcquireNextImageKHR acquire_next_image = nullptr;
     PFN_vkQueuePresentKHR queue_present = nullptr;
+    // Null when the runtime has none.
+    PFN_vkSetHdrMetadataEXT set_hdr_metadata = nullptr;
   };
 
   // Null when the runtime, its frame generation or the spare queues are

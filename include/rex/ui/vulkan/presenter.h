@@ -847,6 +847,8 @@ class VulkanPresenter final : public Presenter {
   VkDescriptorSetLayout frame_generation_compose_set_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout frame_generation_compose_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline frame_generation_compose_pipeline_ = VK_NULL_HANDLE;
+  // For an scRGB swapchain (present_hdr).
+  VkPipeline frame_generation_compose_hdr_pipeline_ = VK_NULL_HANDLE;
   VkDescriptorPool frame_generation_compose_descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSet, PaintContext::kFrameGenerationComposeImageCount>
       frame_generation_compose_sets_ = {};

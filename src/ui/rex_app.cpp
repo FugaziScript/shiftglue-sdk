@@ -34,6 +34,7 @@
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/chrono/clock.h>
 #include <rex/input/input_system.h>
+#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/kernel/init.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/string/numeric.h>
@@ -53,6 +54,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <string_view>
 
@@ -69,6 +71,45 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
 namespace rex {
 
 namespace {
+// bind_hdr and bind_hdr_debug_nits: a short note at the top of the screen naming what was picked.
+// It deletes itself (ImGuiDialog::Close) once shown long enough; a new press restarts it.
+class HdrTonemapNote final : public ui::ImGuiDialog {
+ public:
+  static void Show(ui::ImGuiDrawer* drawer, std::string text) {
+    if (!current_) current_ = new HdrTonemapNote(drawer);
+    current_->text_ = std::move(text);
+    current_->shown_ = std::chrono::steady_clock::now();
+  }
+  static void Hide() {
+    delete current_;
+  }
+  ~HdrTonemapNote() override { current_ = nullptr; }
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    if (std::chrono::steady_clock::now() - shown_ > std::chrono::milliseconds(2500)) {
+      Close();
+      return;
+    }
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.06f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.7f);
+    if (ImGui::Begin("##hdr_note", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+      ImGui::TextUnformatted(text_.c_str());
+    }
+    ImGui::End();
+  }
+
+ private:
+  explicit HdrTonemapNote(ui::ImGuiDrawer* drawer) : ImGuiDialog(drawer) {}
+  static inline HdrTonemapNote* current_ = nullptr;
+  std::string text_;
+  std::chrono::steady_clock::time_point shown_;
+};
+
 class ShaderStorageDialog final : public ui::ImGuiDialog {
  public:
   ShaderStorageDialog(ui::ImGuiDrawer* drawer,
@@ -559,26 +600,53 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
           std::make_unique<ui::DebugOverlayDialog>(imgui_drawer_.get(), frame_stats_provider_);
     }
   });
-  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this] {
+  // The debug overlay only shows numbers; these three take clicks.
+  const auto dialogs_changed = [this] {
+    rex::input::mnk::SetHostDialogOpen(console_overlay_ || settings_overlay_ ||
+                                       achievements_overlay_);
+  };
+  rex::ui::RegisterBind("bind_console", "Backtick", "Toggle console overlay", [this, dialogs_changed] {
     if (console_overlay_) {
       console_overlay_.reset();
     } else {
       console_overlay_ = std::make_unique<ui::ConsoleDialog>(imgui_drawer_.get(), log_sink_);
     }
+    dialogs_changed();
   });
-  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this] {
+  rex::ui::RegisterBind("bind_settings", "F4", "Toggle settings overlay", [this, dialogs_changed] {
     if (settings_overlay_) {
       settings_overlay_.reset();
     } else {
       settings_overlay_ = std::make_unique<ui::SettingsDialog>(imgui_drawer_.get(), config_path_);
     }
+    dialogs_changed();
   });
-  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this] {
+  // present_hdr on and off, for comparing HDR with SDR in a race; not saved (the LIGHTING
+  // tab's HDR is). The presenter recreates its swapchain for the change.
+  rex::ui::RegisterBind("bind_hdr", "F9", "Turn HDR on or off", [this] {
+    const bool on = rex::cvar::GetFlagByName("present_hdr") != "true";
+    rex::cvar::SetFlagByName("present_hdr", on ? "true" : "false");
+    REXLOG_INFO("bind_hdr: present_hdr = {}", on);
+    if (imgui_drawer_) HdrTonemapNote::Show(imgui_drawer_.get(), on ? "HDR: ON" : "HDR: OFF");
+  });
+  rex::ui::RegisterBind("bind_hdr_debug_nits", "F10",
+                        "Show the HDR picture's brightness in bands of colour", [this] {
+    const bool on = rex::cvar::GetFlagByName("present_hdr_debug_nits") != "true";
+    rex::cvar::SetFlagByName("present_hdr_debug_nits", on ? "true" : "false");
+    if (imgui_drawer_) {
+      HdrTonemapNote::Show(imgui_drawer_.get(),
+                           on ? "Nits: grey <100, blue <200, green <400, yellow <600, "
+                                "orange <800, red above"
+                              : "Nits view off");
+    }
+  });
+  rex::ui::RegisterBind("bind_achievements", "F7", "Toggle achievements overlay", [this, dialogs_changed] {
     if (achievements_overlay_) {
       achievements_overlay_.reset();
     } else {
       achievements_overlay_ = CreateAchievementsOverlay();
     }
+    dialogs_changed();
   });
 
   OnCreateDialogs(imgui_drawer_.get());
@@ -819,6 +887,7 @@ void ReXApp::OnDestroy() {
   }
   achievement_notification_.reset();
   achievements_overlay_.reset();
+  HdrTonemapNote::Hide();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

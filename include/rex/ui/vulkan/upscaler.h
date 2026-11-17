@@ -63,6 +63,9 @@ class VulkanUpscaler {
 // The temporal providers built into this build, available or not.
 std::vector<std::unique_ptr<VulkanUpscaler>> CreateVulkanUpscalers(const VulkanDevice* device);
 
+// Snapdragon Game Super Resolution 2 (shaders built in; any Vulkan device).
+std::unique_ptr<VulkanUpscaler> CreateVulkanSgsr2Upscaler(const VulkanDevice* device);
+
 // DLSS through NGX, or null when the build has no DLSS (REX_HAS_DLSS).
 std::unique_ptr<VulkanUpscaler> CreateVulkanDlssUpscaler(const VulkanDevice* device);
 

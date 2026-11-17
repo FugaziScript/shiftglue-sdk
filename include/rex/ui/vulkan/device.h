@@ -199,6 +199,11 @@ class VulkanDevice {
 
     bool pipelineFragmentShadingRate = false;
 
+    // VK_KHR_compute_shader_derivatives, for AMD's FidelityFX SDK 2.x shaders.
+
+    bool computeDerivativeGroupQuads = false;
+    bool computeDerivativeGroupLinear = false;
+
     // VK_EXT_device_fault (#342); the vendor binary only with
     // vulkan_device_address_bindings.
 
@@ -269,6 +274,10 @@ class VulkanDevice {
     bool ext_KHR_pipeline_executable_properties = false;  // #270
     // Has optional features not implied by this being true.
     bool ext_KHR_fragment_shading_rate = false;  // #227
+    // Has optional features not implied by this being true.
+    bool ext_KHR_compute_shader_derivatives = false;
+    // Has optional features not implied by this being true.
+    bool ext_EXT_shader_image_atomic_int64 = false;
     // Has optional features not implied by this being true.
     bool ext_EXT_device_fault = false;  // #342
     // Only with vulkan_device_address_bindings.
@@ -391,6 +400,24 @@ class VulkanDevice {
   // May be the same as queue_family_graphics_compute().
   uint32_t queue_family_sparse_binding() const { return queue_family_sparse_binding_; }
 
+  // A queue the device created that nothing else in the SDK submits to.
+  struct QueueSlot {
+    uint32_t family = UINT32_MAX;
+    uint32_t index = 0;
+    bool valid() const { return family != UINT32_MAX; }
+  };
+  // Spare queues for AMD's frame generation swapchain, which presents and
+  // composes on its own queues (vulkan_frame_generation_queues). present is
+  // invalid when the device has no spare queue that can present.
+  struct FrameGenerationQueues {
+    QueueSlot present;
+    QueueSlot async_compute;
+    QueueSlot image_acquire;
+  };
+  const FrameGenerationQueues& frame_generation_queues() const {
+    return frame_generation_queues_;
+  }
+
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
@@ -425,6 +452,7 @@ class VulkanDevice {
   std::vector<QueueFamily> queue_families_;
   uint32_t queue_family_graphics_compute_ = UINT32_MAX;
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
+  FrameGenerationQueues frame_generation_queues_;
 
   MemoryTypes memory_types_;
 };

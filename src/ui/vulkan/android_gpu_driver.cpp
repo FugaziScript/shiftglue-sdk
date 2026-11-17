@@ -325,7 +325,9 @@ void* OpenAndroidCustomVulkanDriver(const std::filesystem::path& drivers_root) {
     name = recommended;
     REXLOG_INFO("GPU driver auto: {} recommended for this GPU", name);
   }
-  if (name.empty()) {
+  // "system" too: settings files drop an empty value.
+  if (name.empty() || name == "system") {
+    REXLOG_INFO("GPU driver: the system's");
     return nullptr;
   }
   const std::filesystem::path source = drivers_root / name;

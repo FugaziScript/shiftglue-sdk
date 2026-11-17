@@ -31,6 +31,9 @@ struct DeviceInfo {
   std::string name;
   std::string guid;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  // A drum kit, guitar, dance pad, flight stick or throttle: it takes a guest
+  // user only after every gamepad, so a stray one cannot hold player one.
+  bool non_gamepad = false;
   PadFamily family = PadFamily::kUnknown;
   uint16_t vendor_id = 0;
   uint16_t product_id = 0;

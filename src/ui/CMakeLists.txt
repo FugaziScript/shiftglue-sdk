@@ -43,6 +43,9 @@ set(REXUI_VULKAN_SOURCES
     vulkan/ui_samplers.cpp
     vulkan/vulkan_dlss_upscaler.cpp
     vulkan/vulkan_ffx_upscaler.cpp
+    vulkan/vulkan_sgsr2_upscaler.cpp
+    vulkan/vulkan_ffx_frame_generation.cpp
+    vulkan/vulkan_lsfg.cpp
     vulkan/vulkan_device.cpp
     vulkan/vulkan_immediate_drawer.cpp
     vulkan/vulkan_instance.cpp
@@ -138,6 +141,12 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
+endif()
+
+# Lossless Scaling frame generation: the presenter loads liblsfg_framegen.so by name.
+target_include_directories(rexui PRIVATE "${PROJECT_SOURCE_DIR}/thirdparty/lsfg-vk/bridge")
+if(TARGET lsfg_framegen)
+    add_dependencies(rexui lsfg_framegen)
 endif()
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)

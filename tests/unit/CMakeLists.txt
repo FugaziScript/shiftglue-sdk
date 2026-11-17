@@ -33,12 +33,15 @@ add_executable(unit_tests
     input/xinputd_ffb_test.cpp
     input/rumble_sender_test.cpp
     input/mnk_inactive_keys_test.cpp
+    input/mnk_hold_look_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
     codegen/host_local_lr_test.cpp
     codegen/register_locals_test.cpp
     filesystem/cache_mount_test.cpp
+    filesystem/content_override_test.cpp
+    filesystem/delete_on_close_test.cpp
     filesystem/long_path_test.cpp
     graphics/shader_storage_initialization_test.cpp
     graphics/startup_pipeline_compilation_test.cpp

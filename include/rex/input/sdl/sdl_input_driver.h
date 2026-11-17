@@ -112,6 +112,12 @@ class SDLInputDriver final : public InputDriver,
     uint16_t product_id = 0;
     bool steam_virtual = false;
     bool dualsense = false;  // trigger effects allowed
+    // A drum kit, guitar, dance pad, flight stick or throttle.
+    bool non_gamepad = false;
+    // A ViGEmBus virtual pad (DS4Windows), and a real pad left out while one
+    // is plugged in (HiddenBehindVirtualPad).
+    bool virtual_pad = false;
+    bool hidden_by_virtual = false;
     bool lightbar = false;
     bool motion = false;
     dualsense::EffectChannel triggers;
@@ -194,6 +200,7 @@ class SDLInputDriver final : public InputDriver,
   // motors (the crash path, where SDL never closes the pad).
   bool ReleaseFeedbackLocked(ControllerState& controller, bool stop_rumble = false);
   void ApplyPlayerLedHint();
+  void UpdateVirtualPadHidingLocked();
 
   // Wheel support (FB-2): raw SDL joysticks rather than gamepads, so axes keep
   // their own ranges and force feedback can use the haptic subsystem.
@@ -281,6 +288,9 @@ class SDLInputDriver final : public InputDriver,
   int player_led_hint_ = -1;
   uint64_t log_window_start_ns_ = 0;
   uint64_t log_window_reports_ = 0;
+  // A virtual pad can leave without an SDL event for the real one, so a
+  // hidden pad has its virtual pad looked for again now and then.
+  uint64_t virtual_check_ns_ = 0;
   // Pads' vibration, by SDL joystick instance id.
   RumbleSender rumble_;
 };

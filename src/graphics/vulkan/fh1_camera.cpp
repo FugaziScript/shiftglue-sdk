@@ -757,6 +757,10 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
   if (camera_depth_.image != VK_NULL_HANDLE &&
       (camera_depth_.width != width || camera_depth_.height != full_height)) {
     camera_depth_rows_ = 0;
+    REXGPU_INFO("FH1 camera: depth copy {}x{} remade as {}x{} (surface {}x{} at row {}), "
+                "waiting for the GPU",
+                camera_depth_.width, camera_depth_.height, width, full_height, surface->width,
+                surface->height, band_row);
     command_processor_.Fh1AwaitAllQueueOperations();
     if (camera_depth_.view) dfn.vkDestroyImageView(device, camera_depth_.view, nullptr);
     if (camera_depth_.image) dfn.vkDestroyImage(device, camera_depth_.image, nullptr);

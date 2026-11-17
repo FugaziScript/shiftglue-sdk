@@ -58,10 +58,11 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
 #if defined(REX_HAS_FIDELITYFX_SDK)
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas (sharpen, and resample when "
-                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening), fsr2 and fsr3 "
-                      "(temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX); "
+                      "downscaling), fsr (FSR 1 upscale with RCAS sharpening), fsr2, fsr3 and "
+                      "fsr4 (temporal FSR through the FidelityFX runtime), dlss (DLSS through NGX), "
+                      "gsr2 (Snapdragon Game Super Resolution 2, light, for Adreno GPUs); "
                       "FSR 1 when the temporal upscaler is unavailable")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "dlss"});
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "fsr4", "dlss", "gsr2"});
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -126,8 +127,14 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   if (lowered == "fsr3") {
     return GuestOutputPaintConfig::Effect::kFsr3;
   }
+  if (lowered == "fsr4") {
+    return GuestOutputPaintConfig::Effect::kFsr4;
+  }
   if (lowered == "dlss") {
     return GuestOutputPaintConfig::Effect::kDlss;
+  }
+  if (lowered == "gsr2") {
+    return GuestOutputPaintConfig::Effect::kGsr2;
   }
 #endif
   return GuestOutputPaintConfig::Effect::kBilinear;
@@ -199,7 +206,7 @@ void LogTemporalFsrCompatibilityPathOnce() {
   static std::atomic<bool> temporal_fsr_compatibility_logged = false;
   if (!temporal_fsr_compatibility_logged.exchange(true)) {
     REXLOG_INFO(
-        "present_effect=fsr2/fsr3: temporal FSR with the game's depth, camera motion "
+        "present_effect=fsr2/fsr3/fsr4: temporal FSR with the game's depth, camera motion "
         "and jitter where the title provides them; FSR 1 when the FidelityFX runtime "
         "is unavailable");
   }

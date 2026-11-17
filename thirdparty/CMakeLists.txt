@@ -220,6 +220,13 @@ if(REXGLUE_USE_VULKAN)
 endif()
 
 #=============================================================================
+# Lossless Scaling frame generation (liblsfg_framegen.so, loaded on demand)
+#=============================================================================
+if(ANDROID AND REXGLUE_USE_VULKAN)
+    add_subdirectory(lsfg-vk)
+endif()
+
+#=============================================================================
 # FidelityFX (optional, fetched on demand)
 #=============================================================================
 include(${PROJECT_SOURCE_DIR}/cmake/rexglue_fidelityfx.cmake)
